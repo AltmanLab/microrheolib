@@ -3,7 +3,8 @@ import numpy as np
 import pandas as pd
 from scipy import signal
 import scipy
-from dataclasses import dataclass
+
+from dataclasses import dataclass, field
 
 plt.style.use('default')
 
@@ -22,13 +23,20 @@ PRESET_ETA = {
 
 # helper class to store analysis parameters
 @dataclass
+class CalibrationParams:
+    starttime: int = 0
+    endtime: int = 120
+    startfreqx: int = 20
+    endfreqx: int = 5000
+    startfreqy: int = 20
+    endfreqy: int = 5000
+    fg_starttime: int = 0
+    fg_endtime: int = 200
+    chunk_dur: float = 1.0
+
+@dataclass
 class AnalysisParams:
-    calib_starttime: int = 0
-    calib_endtime: int = 120
-    fgcalib_starttime: int = 0
-    fgcalib_endtime: int = 200
-    calib_startfreq: int = 20
-    calib_endfreq: int = 5000
+    calib: CalibrationParams = field(default_factory=CalibrationParams)
     data_starttime: int = 0
     data_endtime: int = 300
     alphaincrement: float = 0.001

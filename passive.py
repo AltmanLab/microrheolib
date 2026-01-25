@@ -6,9 +6,9 @@ from scipy.interpolate import interp1d
 
 class PassiveAnalysis(OTDataset): # inheritance, with OTDataset = parent, PassiveAnalysis = child
     '''Class for processing passive OT datasets'''
-    def __init__(self, fh, analysisparams, params=None):
+    def __init__(self, name, fh, analysisparams, params=None):
         '''fh: file handle for where brownian folder can be found, subhandle: relative file handle of the passive dataset i.e. bead1p/'''
-        super().__init__(fh, analysisparams, params)
+        super().__init__(name, fh, analysisparams, params)
 
         self.analysisparams = analysisparams
 

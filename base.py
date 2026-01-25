@@ -5,15 +5,17 @@ from scipy.optimize import curve_fit
 
 class OTDataset:
     '''Parent class for passive and active datasets, ideally should handle the calibration & the function generator calibration'''
-    def __init__(self, fh, analysisparams, calibration_params=None):   # doesn't matter what you set calib_starttime and calib_endtime to if you have the calibration already
+    def __init__(self, name, fh, analysisparams, calibration_params=None):   # doesn't matter what you set calib_starttime and calib_endtime to if you have the calibration already
         '''
         Args:
+        name: display name
         fh: file handle for the dataset !!NO TAILING SLASH!! ex: 'My Drive/Altman Lab Articles and Protocols/UPLOADED DATA/name/date/bead1'
         optional:
         calibration_params: tuple of floats, (Sx, Sy, kx, ky, trapx, trapy) -> calibration parameters for the trap
         '''
+        self.name = name
         self.fh = fh
-        if calibration_params is None:
+        if calibration_params is None or not calibration_params:
         # if no calibration parameters are given, calibrate the trap from the brownian data
             self.Sx, self.Sy, self.kx, self.ky, self.trapx, self.trapy = self._brownian_analysis(analysisparams, visualize=True)
             print(f'[{self.Sx}, {self.Sy}, {self.kx}, {self.ky}, {self.trapx}, {self.trapy}]')
@@ -39,7 +41,7 @@ class OTDataset:
         self.sumsignal = None
         self.fg = None
 
-    def _load_data(self, fh:str, starttime, endtime, return_power_spectrum:bool = False) -> tuple[np.array, np.array, np.array, np.array]:
+    def _load_data(self, fh:str, starttime, endtime, return_power_spectrum:bool=False, chunk_dur=1.0) -> tuple[np.array, np.array, np.array, np.array]:
 
         # I had to add sections that allow us to choose a chunk of the data (this is the starttime and endtime)
 
@@ -49,6 +51,7 @@ class OTDataset:
         Args:
         fh: file handle
         return_power_spectrum: bool = False, whether to return the power spectrum of the data or not
+        chunk_dur: float = 1.0, duration of chunk size in seconds for power spectrum
 
         Returns:
         longdatax: np.array, x position data
@@ -66,8 +69,6 @@ class OTDataset:
         longdatay = []
         longdatasum = []
         longdatafg = []
-        powerspecx = np.zeros(2501)
-        powerspecy = np.zeros(2501)
 
         fhs = sorted(os.listdir(fh), key=file_sort)
         fhs = fhs[:-1] # remove the last file, as this causes errors
@@ -92,11 +93,13 @@ class OTDataset:
         longdatafg = np.array(longdatafg)[indexcut]
 
         if return_power_spectrum:
-            breakitup = 0.1  # time of chunk (1/10 s)
-            for k in range(0, (len(longdatax)), int(breakitup*fs)):
-                if len(longdatax[k:int(k+breakitup*fs)]) == 5000:
-                  dataxchunk = longdatax[k:int(k+breakitup*fs)]
-                  dataychunk = longdatay[k:int(k+breakitup*fs)]
+            powerspecx = np.zeros(int(chunk_dur*fs//2+1))
+            powerspecy = np.zeros(int(chunk_dur*fs//2+1))
+            
+            for k in range(0, (len(longdatax)), int(chunk_dur*fs)):
+                if len(longdatax[k:int(k+chunk_dur*fs)]) == chunk_dur*fs:
+                  dataxchunk = longdatax[k:int(k+chunk_dur*fs)]
+                  dataychunk = longdatay[k:int(k+chunk_dur*fs)]
                   fx, Pxx_den = calcpowerspec2(dataxchunk)
                   powerspecx += Pxx_den
                   fy, Pyy_den = calcpowerspec2(dataychunk)
@@ -136,6 +139,8 @@ class OTDataset:
             x, y, r, fg = [], [], [], []
             
             files = sorted(os.listdir(folder_path), key=file_sort)[:-1]
+            
+            if not files: continue # skip empty folders
 
             for file in files:
                 dim = openfile(os.path.join(folder_path, file))
@@ -168,51 +173,72 @@ class OTDataset:
         else:
             raise ValueError('No brownian data found in the folder')
 
-        xb, yb, sumsignalb, fg, f, powerspecx, powerspecy = self._load_data(fh, analysisparams.calib_starttime, analysisparams.calib_endtime, return_power_spectrum=True)
-        initial = 4 # starting frequency for the fit.  # this should be varied
-        list = [i for i in range(len(f)) if f[i] <  analysisparams.calib_startfreq]
-        initial = list[-1]
-        list = [i for i in range(len(f)) if f[i] > analysisparams.calib_endfreq] # this should be varied
-        final = list[0]
+        xb, yb, sumsignalb, fg, freqs, powerspecx, powerspecy = self._load_data(fh, analysisparams.calib.starttime, analysisparams.calib.endtime,
+                                                                                return_power_spectrum=True, chunk_dur=analysisparams.calib.chunk_dur)
+                
+        # x, loop forward and backwards for efficiency
+        initialx, finalx = 0, 0 # indicies for x fit
+        for i, freq in enumerate(freqs):
+            if freq >= analysisparams.calib.startfreqx:
+                initialx = i
+                break
+        
+        for i, freq in reversed(list(enumerate(freqs))):
+            if freq <= analysisparams.calib.endfreqx:
+                finalx = i
+                break
+            
+        # y, loop forward and backwards for efficiency
+        initialy, finaly = 0, 0 # indicies for y fit
+        for i, freq in enumerate(freqs):
+            if freq >= analysisparams.calib.startfreqy:
+                initialy = i
+                break
+        
+        for i, freq in reversed(list(enumerate(freqs))):
+            if freq <= analysisparams.calib.endfreqy:
+                finaly = i
+                break
 
         # Fit the power spectrum to get the trap stiffness
         # x
-        poptx, pcov = curve_fit(func, f[initial:final], powerspecx[initial:final], p0=[1e5, 1e-3])
+        poptx, pcov = curve_fit(func, freqs[initialx:finalx], powerspecx[initialx:finalx], p0=[1e5, 1e-3])
         alphax = abs(poptx[1])
 
         # y
-        popty, pcov = curve_fit(func, f[initial:final], powerspecy[initial:final], p0=[1e5, 1e-3])
+        popty, pcov = curve_fit(func, freqs[initialy:finaly], powerspecy[initialy:finaly], p0=[1e5, 1e-3])
         alphay = abs(popty[1])
+        
         if visualize:
-            fig=plt.figure(figsize=(10, 10), tight_layout=True)
+            fig = plt.figure(figsize=(10, 10), tight_layout=True)
             fig.suptitle('OT Calibration')
             xplot = fig.add_subplot(221)
             xplot.set_title('Power Spectrum of X')
-            xplot.loglog(f, powerspecx, 'k.')
-            xplot.loglog(f[initial:final], func(f[initial:final], *poptx), 'r-')
-            xplot.set_xlabel('Frequency (Hz)')
-            xplot.set_ylabel('Power Spectrum ($V^2$/Hz)')
+            xplot.loglog(freqs, powerspecx, 'k.')
+            xplot.loglog(freqs[initialx:finalx], func(freqs[initialx:finalx], *poptx), 'r-')
+            xplot.set_xlabel('Frequency [Hz]')
+            xplot.set_ylabel('Power Spectrum [$V^2$/Hz]')
 
             yplot = fig.add_subplot(222)
             yplot.set_title('Power Spectrum of Y')
-            yplot.loglog(f, powerspecy, 'k.')
-            yplot.loglog(f[initial:final], func(f[initial:final], *popty), 'r-')
-            yplot.set_xlabel('Frequency (Hz)')
-            yplot.set_ylabel('Power Spectrum ($V^2$/Hz)')
+            yplot.loglog(freqs, powerspecy, 'k.')
+            yplot.loglog(freqs[initialy:finaly], func(freqs[initialy:finaly], *popty), 'r-')
+            yplot.set_xlabel('Frequency [Hz]')
+            yplot.set_ylabel('Power Spectrum [$V^2$/Hz]')
 
             fig2=plt.figure(figsize=(10, 5))
-            fig2.suptitle('Calibration data')
+            fig2.suptitle('Calibration Data')
             t = np.arange(len(xb))*dt
             xpos=fig2.add_subplot(311)
             xpos.plot(t,xb,'k')
-            xpos.set_ylabel('x[V]')
+            xpos.set_ylabel('x [V]')
             ypos=fig2.add_subplot(312)
             ypos.plot(t,yb,'k')
-            ypos.set_ylabel('y[V]')
+            ypos.set_ylabel('y [V]')
             ypos.set_xlabel('Time [s]')
             sumsignal=fig2.add_subplot(313)
             sumsignal.plot(t,sumsignalb,'k')
-            sumsignal.set_ylabel('sum[V]')
+            sumsignal.set_ylabel('sum [V]')
             sumsignal.set_xlabel('Time [s]')
             plt.plot()
 
@@ -361,7 +387,7 @@ class OTDataset:
             fh += 'FunctionG/'
         else:
             raise ValueError('No function generator data found in the folder')
-        x, y, sumsignal, fg = self._load_data(fh, self.analysisparams.fgcalib_starttime, self.analysisparams.fgcalib_endtime)
+        x, y, sumsignal, fg = self._load_data(fh, self.analysisparams.calib.fg_starttime, self.analysisparams.calib.fg_endtime)
         
         a, b, coeffs = self.calibrate_from_data(x, y, fg, poly_fit=poly_fit, lin_range=lin_range, show_plots=show_plots)
         

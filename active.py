@@ -11,9 +11,9 @@ class ActiveAnalysis(OTDataset):
         compute_moduli: calculates G' and G" from the resulting data
         plot_g1g2: plot final G' and G" graph
     '''
-    def __init__(self, fh, analysisparams, params=None):
+    def __init__(self, name, fh, analysisparams, params=None):
         '''fh: file handle of the active dataset i.e. bead1 !!!NO TAILING SLASH!!! '''
-        super().__init__(fh, analysisparams, params)
+        super().__init__(name, fh, analysisparams, params)
         
         self.analysisparams = analysisparams
 
