@@ -1,5 +1,8 @@
+from numpy import ndarray
 from microrheo.base import OTDataset
 from microrheo.utils import *
+
+from scipy.signal import ShortTimeFFT, windows
 
 class LockinAnalysis(OTDataset):
     '''Class for processing active OT datasets using the lock-in amplifier
@@ -20,18 +23,18 @@ class LockinAnalysis(OTDataset):
         self.fh = fh +'/'
         self.data_dict = self._load_lockin_data(fh)
         
-    def analyze_chunk(self, data:dict, fg_freq, start_index:int, end_index:int, show_plots=False) -> dict:
+    def analyze_chunk(self, data:dict, fg_freq, start_index:int, end_index:int, show_plots=False, debug_mode=False) -> dict:
         """Analyze one frequency chunk and create the 'result' object correlating to that frequency chunk"""
         fg_chunk = self.a * data['fg'][start_index:end_index] + self.b
         
         skip_percent = 0.75
-        skip_index = int((end_index - start_index) // (1/skip_percent))
-        x_chunk = data['x'][start_index + skip_index:end_index - fs//2] # only keep the second half of the data
-        y_chunk = data['y'][start_index + skip_index:end_index - fs//2] # this gives time for the lock-in to equilibrate
-        r_chunk = data['r'][start_index + skip_index:end_index - fs//2]
+        skip_index = int((end_index - fs//2 - start_index) // (1/skip_percent))
+        x_chunk = np.mean(data['x'][start_index + skip_index:end_index - fs//2]) # only keep the second half of the data
+        y_chunk = np.mean(data['y'][start_index + skip_index:end_index - fs//2]) # this gives time for the lock-in to equilibrate
+        r_chunk = np.mean(data['r'][start_index + skip_index:end_index - fs//2])
         
         if show_plots:
-            fig, axs = plt.subplots(3, 1, figsize=(10, 5), tight_layout=True)
+            fig, axs = plt.subplots(4, 1, figsize=(12, 5), tight_layout=True)
             fig.suptitle(f'Frequency Chunk: {fg_freq} Hz')
             axs[0].plot(data['x'][start_index:end_index])
             axs[0].set_title('X Data (Lock-in)')
@@ -47,91 +50,176 @@ class LockinAnalysis(OTDataset):
             axs[2].axvline(len(data['r'][start_index:end_index]) - fs // 2, color='r', linestyle='--')
             fig.show()
 
+        # F_trap = -ky*y_trap - ky*y_bead
+
         y_trap = np.sqrt(2) * np.std(fg_chunk - np.mean(fg_chunk)) # sqrt(2) * std(zero mean fg)
         A = self.ky * y_trap * 1e-9
         
-        B = -self.ky * np.mean(r_chunk) 
-        phi = np.arctan2(np.mean(y_chunk), np.mean(x_chunk))
+        B = -self.ky * r_chunk 
+        phi = np.arctan2(y_chunk, x_chunk)
         
         C = np.sqrt(A**2 + B**2 + 2 * A * B * np.cos(phi))
         phi_new = np.arctan2(B * np.sin(phi), A + B * np.cos(phi))
 
         delta_phi = phi - phi_new
-        
+                
         result = {
             'fg_freq': None, # gets filled in later
             'fnot': C,
-            'ynot': np.mean(r_chunk),
-            'delta': delta_phi
+            'ynot': r_chunk,
+            'delta': delta_phi,
         }
+        
+        if debug_mode:
+            result.update({'phi': phi, 'x': x_chunk, 'y': y_chunk})
+        
         return result
     
-    def analyze_trial(self, data:dict, show_plots=False) -> dict:
+    def analyze_trial(self, data:dict, show_plots=False, debug_mode=False) -> dict:
         '''Calculate the 'results' object for one set of data (e.g. one trial)'''
         fg = data['fg']
-        freqs, change_idxs = self.compute_freq_changes(fg, show_plots=show_plots)
+        freqs, change_idxs = self.compute_freq_changes_sfft(fg, show_plots=show_plots)
 
         results = []
         for i in range(len(change_idxs) - 1):
-            start = change_idxs[i] * fs
-            end = change_idxs[i + 1] * fs
+            chunk_len = fs // 4 # divide by hop length
+            start_idx = change_idxs[i] * chunk_len
+            end_idx = change_idxs[i + 1] * chunk_len
             
-            result = self.analyze_chunk(data, freqs[change_idxs[i]], start, end, show_plots=show_plots)
-            result['fg_freq'] = freqs[change_idxs[i]]
+            freq_idx = (change_idxs[:-1] + change_idxs[1:] - 1) // 2
+                        
+            result = self.analyze_chunk(data, freqs[freq_idx[i]], start_idx, end_idx, show_plots=show_plots, debug_mode=debug_mode)
+            result['fg_freq'] = freqs[freq_idx[i]]
             results.append(result)
             
         return results
         
-    def analyze_all_trials(self, data:dict, show_plots=False) -> dict:
+    def analyze_all_trials(self, data:dict, show_plots=False, debug_mode=False) -> dict:
         '''Calculate the 'results' object for all of the trials'''
         results_all = []
         for trial in data.keys():
-            trial_results = self.analyze_trial(data[trial], show_plots=show_plots)
+            trial_results = self.analyze_trial(data[trial], show_plots=show_plots, debug_mode=debug_mode)
             results_all.extend(trial_results)
             
         return results_all
     
-    def compute_freq_changes(self, fg:np.ndarray, show_plots=False):
-        dominant_freqs = []
-        for i in range(0, len(fg), fs): # 1 second chunks
-            fg_chunk = fg[i:i+fs]
-            
-            fft = scipy.fft.fft(fg_chunk)
-            N = len(fg_chunk)
-            n = np.arange(N)
-            T = N / fs
-            freq = n / T
-            index = (freq > 0.1) * (freq < 20000)
-            freq = freq[index]
-            fft = np.abs(fft[index])
-            top_freq = freq[fft == np.max(fft)]
-            dominant_freqs.append(top_freq[0])
-            
-        dominant_freqs = np.array(dominant_freqs)
-        freq_changes = np.where(np.diff(dominant_freqs) > 0.5)[0] + 1
-        freq_changes = np.insert(freq_changes, 0, 0) # add first index
-        freq_changes = np.append(freq_changes, len(dominant_freqs)) # add last index
-                
+    def compute_freq_changes_sfft(self, fg:np.ndarray, show_plots=False):
+        """SFFT style dominant frequency identifier"""
+        T = 0.5 # window_duration (seconds)
+        N = len(fg) # number of samples
+        
+        window_len = int(fs * T)
+        hop_len = int(window_len * 0.5) # overlap window 50%
+        
+        window = windows.hann(window_len, sym=False)
+        
+        SFT = ShortTimeFFT(window, hop=hop_len, fs=fs, mfft=4*window_len) # TODO mfft parameter?
+        fft = SFT.stft(fg)
+        mag = np.abs(fft)
+
         if show_plots:
             plt.figure()
-            plt.plot(dominant_freqs, label='Dominant Frequencies')
-            [plt.text(i, dominant_freqs[i], f"{dominant_freqs[i]:.0f}") for i in freq_changes[:-1]]
+            t_lo, t_hi = SFT.extent(N)[:2]  # time range of plot
+            plt.title(rf"STFT ({SFT.m_num*SFT.T:g}$\,s$ Hann Window)")
+            plt.xlabel(f'Time $t$ in seconds ({SFT.p_num(N)}, $\Delta T$ = {SFT.delta_t:.2f} s)')
+            plt.ylabel(f'Freq. $f$ in Hz ({SFT.f_pts} bins, $\Delta f = {SFT.delta_f} Hz$)')
+            plt.xlim(t_lo, t_hi)
+            plt.ylim(1, 6000)
+            
+            im = plt.imshow(mag, origin='lower', aspect='auto', extent=SFT.extent(N), cmap='viridis')
+            plt.colorbar(im, label='Magnitude')
+            
+            plt.tight_layout()
+            plt.show()
+        
+        dominant_bins = np.argmax(mag, axis=0)
+        dom_freqs = SFT.f[dominant_bins] # dominant freq of bin i
+                
+        freq_tol = 1 # Hz
+        
+        freq_changes = np.where(np.abs(np.diff(dom_freqs)) > freq_tol)[0] + 1
+        boundaries = np.concatenate(([0], freq_changes, [len(dom_freqs)])) # add first and last index
+
+                        
+        if show_plots:
+            plt.figure()
+            plt.plot(dom_freqs, marker='.', label='Dominant Frequencies')
+            mid_idx = (boundaries[:-1] + boundaries[1:] - 1) // 2
+            [plt.text(i, dom_freqs[i], f"{dom_freqs[i]:.0f}") for i in mid_idx]
             plt.title("Dominant Frequency Per Chunk")
             plt.xlabel("Chunk Index")
             plt.ylabel("Frequency (Hz)")
             plt.show()
+        
+        return dom_freqs, boundaries
             
-        return dominant_freqs, freq_changes
-    
-    def compute_moduli(self, results:dict, free_memory=False):
+    def compute_moduli(self, results:dict, free_memory=False, debug_mode=False):
         freq_list = np.array([r['fg_freq'] for r in results])
         ynot = np.array([r['ynot'] for r in results])
         fnot = np.array([r['fnot'] for r in results])
         delta = np.array([r['delta'] for r in results])
+        
+        if debug_mode:
+            phi = np.array([r['phi'] for r in results])
+            x = np.array([r['x'] for r in results])
+            y = np.array([r['y'] for r in results])
+            
+            r_calc = np.concatenate([np.sqrt(data['x']**2 + data['y']**2) for data in self.data_dict.values()])
+            r_filt = np.sqrt(x**2 + y**2)
                 
         G1 = np.abs(fnot / (6 * np.pi * ExperimentalConstants.r * ynot)) * np.cos(delta)
         G2 = np.abs(fnot / (6 * np.pi * ExperimentalConstants.r * ynot)) * np.sin(delta)
-        
+               
+        if debug_mode:             
+            plt.figure()
+            plt.plot(freq_list, x, '.', label='X')
+            plt.plot(freq_list, y, 'g.', label='Y')
+            plt.plot(freq_list, ynot * self.Sy / np.sqrt(2), 'r.', label='R')
+            plt.axhline(0, color='r', linestyle='--')
+            plt.ylabel('Lockin (V)')
+            plt.xlabel('Freq (Hz)')
+            plt.xscale('log')
+            plt.legend()
+            plt.title('X, Y, R Data')
+            plt.show()
+            
+            plt.figure()
+            plt.plot(freq_list, delta, 'r.', label='delta')
+            plt.plot(freq_list, phi-delta, 'g.', label='phi_new')
+            plt.plot(freq_list, phi, '.', label='phi')
+            plt.xlabel('freq (Hz)')
+            plt.ylabel('delta phi (rad)')
+            plt.axhline(np.pi/2, 0 , 1)
+            plt.axhline(np.pi, 0 , 1)
+            plt.xscale('log')
+            plt.legend()
+            plt.title('Deltas')
+            plt.show()
+            
+            plt.figure(figsize=(12.8, 4.8))
+            plt.subplot(1, 2, 1)
+            r = np.concatenate([data['r'] for data in self.data_dict.values()])
+            plt.plot(r * self.Sy / np.sqrt(2), '.', alpha=0.7, label='Lockin R')
+            plt.plot(r_calc, 'r.', alpha=0.7, label='Calc R')
+            plt.title('Raw R Comparison')
+            plt.subplot(1, 2, 2)
+            plt.plot(np.abs(r_calc - (r * self.Sy / np.sqrt(2))), 'r.')
+            plt.title('Absolute Error')
+            plt.show()
+            
+            plt.figure(figsize=(12.8, 4.8))
+            plt.subplot(1, 2, 1)
+            plt.plot(freq_list, ynot * self.Sy / np.sqrt(2), 'o', alpha=0.7, label='Lockin R')
+            plt.plot(freq_list, r_filt, 'go', alpha=0.7, label='Filtered R')
+            plt.xscale('log')
+            plt.legend()
+            plt.title('Filtered R Comparison')
+            plt.subplot(1, 2, 2)
+            plt.plot(freq_list, np.abs(r_filt - (ynot * self.Sy / np.sqrt(2))), 'r.')
+            plt.xscale('log')
+            plt.title('Absolute Error')
+            plt.show()
+
         if free_memory:
             self.data_dict = None
         
@@ -143,6 +231,6 @@ class LockinAnalysis(OTDataset):
         plt.figure()
         plt.loglog(self.omega_list, self.G1, 'k.', label='G\'')
         plt.loglog(self.omega_list, self.G2, 'r.', label='G\'\'')
-        plt.xlabel('Frequency (Hz)')
+        plt.xlabel('Angular Frequency (Radians)')
         plt.ylabel('Viscoelastic Moduli (Pa)')
         plt.legend()
