@@ -33,9 +33,7 @@ class LockinAnalysis(OTDataset):
         means = self._compute_chunk_means(data, chunk_info)
         
         means['fg_freq'] = chunk_info['fg_freq']
-        
-        print(chunk_info)
-        
+                
         return means
         
     def analyze_all_trials(self, data:dict, show_plots=False, debug_mode=False) -> dict:
@@ -49,8 +47,6 @@ class LockinAnalysis(OTDataset):
         # Concatenate dict-of-arrays into one dict
         keys = trial_info[0].keys()
         
-        print(keys)
-
         trials = {
             k: np.concatenate([res[k] for res in trial_info])
             for k in keys
