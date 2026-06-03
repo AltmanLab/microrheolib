@@ -67,20 +67,22 @@ class PassiveAnalysis(OTDataset): # inheritance, with OTDataset = parent, Passiv
 
         # clean NaNs with interpolation
         index = ~np.isnan(msd_list)
-        logmsd_list_temp = np.array(logmsd_list)[index]
-        logtau_list_temp = np.array(logtau_list)[index]
+        logtau_list_filtered = np.array(logtau_list)[index]
+        logmsd_list_filtered = np.array(logmsd_list)[index]
+        omega_list_filtered = np.array(omega_list)[index]
 
-        index = (logtau_list > np.min(logtau_list_temp))*(logtau_list < np.max(logtau_list_temp))
-        logtau_list = np.array(logtau_list)[index]
-        f_interp = interp1d(logtau_list_temp, logmsd_list_temp, kind='linear') # or 'cubic'
-        logmsd_list= f_interp(logtau_list)
-        omega_list = np.array(omega_list)[index]
-        msd_list = np.array(msd_list)[index]
+        #? there is likely no reason to be doing any interpolating to fill in the alpha steps
+        # index = (logtau_list > np.min(logtau_list_temp))*(logtau_list < np.max(logtau_list_temp))
+        # logtau_list = np.array(logtau_list)[index]
+        # f_interp = interp1d(logtau_list_temp, logmsd_list_temp, kind='linear') # or 'cubic'
+        # logmsd_list= f_interp(logtau_list)
+        # omega_list = np.array(omega_list)[index]
+        # msd_list = np.array(msd_list)[index]
 
         # fit polynomial to MSD curve
-        X = logtau_list - logtau_list[0]
+        X = logtau_list_filtered# - logtau_list_filtered[0]
         
-        coef = np.polyfit(X, logmsd_list, deg=degree)
+        coef = np.polyfit(X, logmsd_list_filtered, deg=degree)
         poly_func = np.poly1d(coef)
         derivative_func = np.polyder(poly_func)
         
@@ -91,14 +93,15 @@ class PassiveAnalysis(OTDataset): # inheritance, with OTDataset = parent, Passiv
         
         if show_plots:
             plt.figure()
-            plt.plot(logtau_list, logmsd_list, 'k.', label='Raw')
-            plt.plot(logtau_list, np.polyval(coef, X), 'r-', label='fit', alpha=1)
+            plt.plot(X, logmsd_list_filtered, 'k.', label='Raw')
+            plt.plot(X, logmsd_list, color='tab:red', linestyle='solid', label='Fit')
             plt.title('LogLog MSD')
             plt.xlabel('log(tau)')
             plt.ylabel('log(MSD)')
+            plt.legend()
             plt.show()
         
-        self.logtau_list, self.logmsd_list, self.alpha_list, self.omega_list, self.msd_list = logtau_list, logmsd_list, alpha_list, omega_list, msd_list
+        self.logtau_list, self.logmsd_list, self.alpha_list, self.omega_list, self.msd_list = X, logmsd_list, alpha_list, omega_list_filtered, msd_list
         
         return self.logtau_list, self.logmsd_list, self.alpha_list, self.omega_list, self.msd_list
 

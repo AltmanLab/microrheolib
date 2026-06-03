@@ -146,11 +146,7 @@ class LockinAnalysis(OTDataset):
         if debug_mode:
             phi = results['phi']
             x = results['x']
-            y = results['y']
-            
-            r_calc = np.concatenate([np.sqrt(data['x']**2 + data['y']**2) for data in self.data_dict.values()])
-            r_filt = np.sqrt(x**2 + y**2)
-            
+            y = results['y']            
                 
         G1 = np.abs(fnot / (6 * np.pi * ExperimentalConstants.r * ynot)) * np.cos(delta)
         G2 = np.abs(fnot / (6 * np.pi * ExperimentalConstants.r * ynot)) * np.sin(delta)
@@ -180,30 +176,6 @@ class LockinAnalysis(OTDataset):
             plt.legend()
             plt.title('Deltas')
             plt.show()
-            
-            # plt.figure(figsize=(12.8, 4.8))
-            # plt.subplot(1, 2, 1)
-            # r = np.concatenate([data['r'] for data in self.data_dict.values()])
-            # plt.plot(r * self.Sy / np.sqrt(2), '.', alpha=0.7, label='Lockin R')
-            # plt.plot(r_calc, 'r.', alpha=0.7, label='Calc R')
-            # plt.title('Raw R Comparison')
-            # plt.subplot(1, 2, 2)
-            # plt.plot(np.abs(r_calc - (r * self.Sy / np.sqrt(2))), 'r.')
-            # plt.title('Absolute Error')
-            # plt.show()
-            
-            # plt.figure(figsize=(12.8, 4.8))
-            # plt.subplot(1, 2, 1)
-            # plt.plot(freq_list, ynot * self.Sy / np.sqrt(2), 'o', alpha=0.7, label='Lockin R')
-            # plt.plot(freq_list, r_filt, 'go', alpha=0.7, label='Filtered R')
-            # plt.xscale('log')
-            # plt.legend()
-            # plt.title('Filtered R Comparison')
-            # plt.subplot(1, 2, 2)
-            # plt.plot(freq_list, np.abs(r_filt - (ynot * self.Sy / np.sqrt(2))), 'r.')
-            # plt.xscale('log')
-            # plt.title('Absolute Error')
-            # plt.show()
 
         if free_memory:
             self.data_dict = None
@@ -288,8 +260,8 @@ class LockinAnalysis(OTDataset):
     def _compute_force_phase(self, data, debug_mode=False):
         """Compute force magnitue and phase dependent components."""
         
-        y_trap = self.a * np.sqrt(2) * data['std_fg'] + self.b
-        A = self.ky * y_trap
+        y_trap = self.a * np.sqrt(2) * data['std_fg'] + self.b #? a and b are in nm
+        A = self.ky * y_trap * 1e-9
         
         B = -self.ky * data['mean_r']
         phi = np.arctan2(data['mean_y'], data['mean_x'])
