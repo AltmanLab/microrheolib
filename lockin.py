@@ -1,20 +1,32 @@
-from numpy import ndarray
 from microrheo.base import OTDataset
 from microrheo.utils import *
 
 from scipy.signal import ShortTimeFFT, windows
 
 class LockinAnalysis(OTDataset):
-    """Class for processing active OT datasets using the lock-in amplifier.
+    """Process active microrheology datasets aquired with a lock-in amplifier.
+        
+    Typical workflow::
 
-    Typical workflow:
-        analyze_all_trials()
-        compute_moduli()
-        plot_g1g2()
+        active = LockinAnalysis(name, fh, analysisparams)
+        active.analyze_all_trials()
+        active.compute_moduli()
+        active.plot_g1g2()
     """
 
     def __init__(self, name, fh, analysisparams, params=None):
-        '''fh: file handle of the active lock-in dataset i.e. bead1 !!!NO TAILING SLASH!!! '''
+        """
+        Parameters
+        ----------
+        name : str
+            Human readable display name
+        fh : str
+            Path to the active lock-in dataset directory (no trailing slash!)
+        aalysisparams : dict
+            Analysis configuration
+        params : optional
+            If provided, skips computing the Brownian power spectrum calibration and uses these parameters instead
+        """
         super().__init__(name, fh, analysisparams, params)
         
         self.analysisparams = analysisparams
@@ -24,7 +36,7 @@ class LockinAnalysis(OTDataset):
         self.data_dict = self._load_lockin_data(fh)
             
     def analyze_trial(self, data:dict, show_plots=False, debug_mode=False) -> dict:
-        """Analyze a single trial and return results"""
+        """Segment a signal trail by frequency and return per-chunk statistics"""
         
         dom_freqs, change_idxs = self.compute_freq_changes_sfft(data['fg'], show_plots=show_plots)
 
@@ -33,16 +45,20 @@ class LockinAnalysis(OTDataset):
         means = self._compute_chunk_means(data, chunk_info)
         
         means['fg_freq'] = chunk_info['fg_freq']
+
+        means['fg_freq'][means['fg_freq'] == 0] = 50000 # manually set zero to the largest value since it isn't computed correctly by the SFFT
                 
-        return means
+        return means, chunk_info
         
-    def analyze_all_trials(self, data:dict, show_plots=False, debug_mode=False) -> dict:
-        '''Calculate the 'results' object for all of the trials'''
+    def analyze_all_trials(self, show_plots=False, debug_mode=False) -> dict:
+        """Run 'analyze_trial' over every trial and assemble the rheological results"""
         
-        trial_info = [
-            self.analyze_trial(data[trial], show_plots=show_plots, debug_mode=debug_mode) 
-            for trial in data
+        trial_outputs = [
+            self.analyze_trial(self.data_dict[trial], show_plots=show_plots, debug_mode=debug_mode) 
+            for trial in self.data_dict
         ]
+
+        trial_info, chunk_infos = zip(*trial_outputs)
         
         # Concatenate dict-of-arrays into one dict
         keys = trial_info[0].keys()
@@ -52,40 +68,83 @@ class LockinAnalysis(OTDataset):
             for k in keys
         }
         
-        # normalize X and Y to zero at highest freq; recompute R
+        # Zero X and Y at the highest drive frequency
+        # At the highest frequency the bead response is negligible, 
+        # so any non-zero mean is an instrumental offset that should be removed
         idx_ref = np.argmax(trials['fg_freq'])
         
         x_ref = trials['mean_x'][idx_ref]
         y_ref = trials['mean_y'][idx_ref]
+
+        print(f"Lockin Offset: ({x_ref},{y_ref})")
+
+        trials['mean_x'] -= x_ref
+        trials['mean_y'] -= y_ref
         
-        # to avoid a divide by zero error
-        trials['mean_x'] -= x_ref - 0.0001
-        trials['mean_y'] -= y_ref - 0.0001
+        # R magnitude must be recomputed from the zeroed X and Y values
+        mean_r = np.sqrt(trials['mean_x'] ** 2 + trials['mean_y'] ** 2) * np.sqrt(2)
+
+        snr_r = mean_r / (np.std(mean_r) + 1e-12)
+        trials['snr_r'] = snr_r
+
+        if show_plots:
+            plt.figure()
+            plt.plot(trials['fg_freq'], trials['mean_x'], 'b.', label='X')
+            plt.plot(trials['fg_freq'], trials['mean_y'], 'g.', label='Y')
+            plt.plot(trials['fg_freq'], mean_r, 'r.', label=r'$\sqrt{X^2+Y^2}$')
+            plt.axhline(0, color='r', linestyle='--')
+            plt.ylabel('Lockin (V)')
+            plt.xlabel('Freq (Hz)')
+            plt.xscale('log')
+            plt.legend()
+            plt.title('X, Y, R Data')
+            plt.show()
+
+            plt.figure()
+            plt.semilogx(trials['fg_freq'], snr_r, '.')
+            plt.axhline(2, linestyle='--')
+            plt.ylabel("Bead SNR")
+            plt.xlabel("Frequency")
+            plt.show()
+
+        trials['mean_r'] = 1e-9 * self.ed_fit_func(mean_r)
         
-        mean_r = np.sqrt(trials['mean_x'] ** 2 + trials['mean_y'] ** 2) / self.Sy * np.sqrt(2)
-        
-        trials['mean_r'] = mean_r
-        
-        results = self._compute_force_phase(trials, debug_mode=debug_mode)
+        self.results = self._compute_force_phase(trials, debug_mode=debug_mode)
                     
         # if show_plots:
-        #     fig, axs = plt.subplots(4, 1, figsize=(12, 5), tight_layout=True)
-        #     fig.suptitle(f'Frequency Chunk: {fg_freq} Hz')
-        #     axs[0].plot(data['x'][start_idx:end_idx])
-        #     axs[0].set_title('X Data (Lock-in)')
-        #     axs[0].axvline(skip_idx, color='r', linestyle='--')
-        #     axs[0].axvline(len(data['x'][start_idx:end_idx]) - fs // 2, color='r', linestyle='--')
-        #     axs[1].plot(data['y'][start_idx:end_idx])
-        #     axs[1].set_title('Y Data (Lock-in)')
-        #     axs[1].axvline(skip_idx, color='r', linestyle='--')
-        #     axs[1].axvline(len(data['y'][start_idx:end_idx]) - fs // 2, color='r', linestyle='--')
-        #     axs[2].plot(data['r'][start_idx:end_idx])
-        #     axs[2].set_title('R Data (Lock-in)')
-        #     axs[2].axvline(skip_idx, color='r', linestyle='--')
-        #     axs[2].axvline(len(data['r'][start_idx:end_idx]) - fs // 2, color='r', linestyle='--')
-        #     fig.show()
+        #     for trial_idx, (trial_key, trial) in enumerate(self.data_dict.items()):
+        #         raw = trial
+        #         info = chunk_infos[trial_idx]
 
-        return results
+        #         chunk_id = info['chunk_id']
+        #         valid = info['valid_mask']
+
+        #         for i in range(info['n_chunks']):
+        #             t = np.arange(len(raw['x']))
+        #             mask = (chunk_id == i)
+        #             valid_region = t[valid & mask]
+
+        #             if len(valid_region) == 0: 
+        #                 continue
+
+        #             fig, axs = plt.subplots(3, 1, figsize=(12, 8), tight_layout=True, sharex=True)
+        #             fig.suptitle(f'Frequency Chunk: {info['fg_freq'][i]} Hz')
+                    
+        #             axs[0].plot(t[mask], raw['x'][mask], '.', alpha=0.5)
+        #             axs[0].axvspan(valid_region[0], valid_region[-1], color='r', alpha=0.25)
+        #             axs[1].plot(t[mask], raw['y'][mask], '.', alpha=0.5)
+        #             axs[1].axvspan(valid_region[0], valid_region[-1], color='r', alpha=0.25)
+        #             axs[2].plot(t[mask], raw['r'][mask], '.', alpha=0.5)
+        #             axs[2].axvspan(valid_region[0], valid_region[-1], color='r', alpha=0.25)
+
+        #             axs[0].set_title("Raw X (Lock-In)")
+        #             axs[1].set_title("Raw Y (Lock-In)")
+        #             axs[2].set_title("Raw R (Lock-In)")
+
+        #             for ax in axs:
+        #                 ax.grid(True)
+
+        #             plt.show()
     
     def compute_freq_changes_sfft(self, fg:np.ndarray, show_plots=False):
         """SFFT style dominant frequency identifier"""
@@ -101,20 +160,20 @@ class LockinAnalysis(OTDataset):
         fft = SFT.stft(fg)
         mag = np.abs(fft)
 
-        if show_plots:
-            plt.figure()
-            t_lo, t_hi = SFT.extent(N)[:2]  # time range of plot
-            plt.title(rf"STFT ({SFT.m_num*SFT.T:g}$\,s$ Hann Window)")
-            plt.xlabel(f'Time $t$ in seconds ({SFT.p_num(N)}, $\Delta T$ = {SFT.delta_t:.2f} s)')
-            plt.ylabel(f'Freq. $f$ in Hz ({SFT.f_pts} bins, $\Delta f = {SFT.delta_f} Hz$)')
-            plt.xlim(t_lo, t_hi)
-            plt.ylim(1, 6000)
+        # if show_plots:
+        #     plt.figure()
+        #     t_lo, t_hi = SFT.extent(N)[:2]  # time range of plot
+        #     plt.title(rf"STFT ({SFT.m_num*SFT.T:g}$\,s$ Hann Window)")
+        #     plt.xlabel(rf'Time $t$ in seconds ({SFT.p_num(N)}, $\Delta T$ = {SFT.delta_t:.2f} s)')
+        #     plt.ylabel(rf'Freq. $f$ in Hz ({SFT.f_pts} bins, $\Delta f = {SFT.delta_f} Hz$)')
+        #     plt.xlim(t_lo, t_hi)
+        #     plt.ylim(1, 6000)
             
-            im = plt.imshow(mag, origin='lower', aspect='auto', extent=SFT.extent(N), cmap='viridis')
-            plt.colorbar(im, label='Magnitude')
+        #     im = plt.imshow(mag, origin='lower', aspect='auto', extent=SFT.extent(N), cmap='viridis')
+        #     plt.colorbar(im, label='Magnitude')
             
-            plt.tight_layout()
-            plt.show()
+        #     plt.tight_layout()
+        #     plt.show()
         
         dominant_bins = np.argmax(mag, axis=0)
         dom_freqs = SFT.f[dominant_bins] # dominant freq of bin i
@@ -122,48 +181,64 @@ class LockinAnalysis(OTDataset):
         freq_tol = 1 # Hz
         
         freq_changes = np.where(np.abs(np.diff(dom_freqs)) > freq_tol)[0] + 1
-        boundaries = np.concatenate(([0], freq_changes, [len(dom_freqs)])) # add first and last index
+        boundaries = np.concatenate(([0], freq_changes, [len(dom_freqs)])) # add first and last index        
 
+        chunk_sizes = np.diff(boundaries)
+        keep = chunk_sizes > 1 # only keep freq chunks with more then one sample to remove mid transition values
+        boundaries = np.concatenate(([boundaries[0]], boundaries[1:][keep]))
+
+        merged_boundaries = [boundaries[0]]
+        for i in range(1, len(boundaries) - 1):
+            prev_start, prev_end = merged_boundaries[-1], boundaries[i]
+            curr_end = boundaries[i + 1]
+
+            # frequency of previous chunk
+            prev_chunk_mid = (prev_start + prev_end) // 2
+            prev_freq = dom_freqs[prev_chunk_mid]
+
+            # representative frequency of current chunk
+            curr_chunk_mid = (prev_end + curr_end) // 2
+            curr_freq = dom_freqs[curr_chunk_mid]
+
+            # if same frequency → merge (do NOT append boundary)
+            if np.abs(prev_freq - curr_freq) <= freq_tol:
+                continue
+
+            # otherwise start a new chunk
+            merged_boundaries.append(prev_end)
+
+        # include the final boundary
+        merged_boundaries.append(boundaries[-1])
+        merged_boundaries = np.array(merged_boundaries)
                         
         if show_plots:
             plt.figure()
             plt.plot(dom_freqs, marker='.', label='Dominant Frequencies')
-            mid_idx = (boundaries[:-1] + boundaries[1:] - 1) // 2
-            [plt.text(i, dom_freqs[i], f"{dom_freqs[i]:.0f}") for i in mid_idx]
+            mid_idx = (merged_boundaries[:-1] + merged_boundaries[1:] - 1) // 2
+            [plt.text(i, dom_freqs[i], f"{dom_freqs[i]:.0f}", ha='center') for i in mid_idx]
             plt.title("Dominant Frequency Per Chunk")
             plt.xlabel("Chunk Index")
             plt.ylabel("Frequency (Hz)")
             plt.show()
         
-        return dom_freqs, boundaries
+        return dom_freqs, merged_boundaries
             
-    def compute_moduli(self, results:dict, free_memory=False, debug_mode=False):
-        freq_list = results["fg_freq"]
-        ynot = results["ynot"]
-        fnot = results["fnot"]
-        delta = results["delta"]
+    def compute_moduli(self, free_memory=False, debug_mode=False):
+        """Compute the shear moduli G' and G" from the active microrheology results."""
+        freq_list = self.results["fg_freq"]
+        ynot = self.results["ynot"]
+        fnot = self.results["fnot"]
+        delta = self.results["delta"]
         
         if debug_mode:
-            phi = results['phi']
-            x = results['x']
-            y = results['y']            
+            phi = self.results['phi']
+            x = self.results['x']
+            y = self.results['y']            
                 
         G1 = np.abs(fnot / (6 * np.pi * ExperimentalConstants.r * ynot)) * np.cos(delta)
         G2 = np.abs(fnot / (6 * np.pi * ExperimentalConstants.r * ynot)) * np.sin(delta)
                
-        if debug_mode:             
-            plt.figure()
-            plt.plot(freq_list, x, '.', label='X')
-            plt.plot(freq_list, y, 'g.', label='Y')
-            plt.plot(freq_list, ynot * self.Sy / np.sqrt(2), 'r.', label='R')
-            plt.axhline(0, color='r', linestyle='--')
-            plt.ylabel('Lockin (V)')
-            plt.xlabel('Freq (Hz)')
-            plt.xscale('log')
-            plt.legend()
-            plt.title('X, Y, R Data')
-            plt.show()
-            
+        if debug_mode:                         
             plt.figure()
             plt.plot(freq_list, delta, 'r.', label='delta')
             plt.plot(freq_list, phi-delta, 'g.', label='phi_new')
@@ -178,13 +253,14 @@ class LockinAnalysis(OTDataset):
             plt.show()
 
         if free_memory:
-            self.data_dict = None
+            self.data_dict, self.chunk_info = None, None
         
         self.G1 = G1
         self.G2 = G2
         self.omega_list = 2*np.pi * freq_list
 
     def plot_g1g2(self):
+        """Create the shear moduli plot."""
         plt.figure()
         plt.loglog(self.omega_list, self.G1, 'k.', label='G\'')
         plt.loglog(self.omega_list, self.G2, 'r.', label='G\'\'')
@@ -205,10 +281,9 @@ class LockinAnalysis(OTDataset):
             start_idx = change_idxs[i] * chunk_len
             end_idx = change_idxs[i + 1] * chunk_len
             chunk_id[start_idx:end_idx] = i
-            
         
         # remove equilibration portion
-        skip_percent = 0.75
+        skip_percent = 0.75 # discard the first 75% of each chunk
         valid_mask = np.zeros(n_samples, dtype=bool)
         
         for i in range(n_chunks):
@@ -231,36 +306,39 @@ class LockinAnalysis(OTDataset):
             'fg_freq': fg_freq
         }
 
-
     def _compute_chunk_means(self, data, chunk_info):
         """Compute chunk average X, Y, R, and fg statistics per trial."""
                 
-        cid = chunk_info["chunk_id"][chunk_info["valid_mask"]]
-        n_chunks = chunk_info["n_chunks"]
+        mask = chunk_info['valid_mask']
+        cid = chunk_info['chunk_id'][mask]
+        n_chunks = chunk_info['n_chunks']
 
         counts = np.bincount(cid, minlength=n_chunks)
                                         
-        mean_x = np.bincount(cid, data["x"][chunk_info["valid_mask"]], minlength=n_chunks) / counts
-        mean_y = np.bincount(cid, data["y"][chunk_info["valid_mask"]], minlength=n_chunks) / counts
-        mean_r = np.bincount(cid, data["r"][chunk_info["valid_mask"]], minlength=n_chunks) / counts
-                        
-        fg_valid = data["fg"][chunk_info["valid_mask"]]
+        mean_x = np.bincount(cid, data['x'][mask], minlength=n_chunks) / counts
+        mean_y = np.bincount(cid, data['y'][mask], minlength=n_chunks) / counts
+        mean_r = np.bincount(cid, data['r'][mask], minlength=n_chunks) / counts
+
+        fg_valid = data['fg'][mask]
         mean_fg = np.bincount(cid, weights=fg_valid, minlength=n_chunks) / counts
         mean_fg2 = np.bincount(cid, weights=fg_valid**2, minlength=n_chunks) / counts - mean_fg ** 2
 
-        std_fg = np.sqrt(mean_fg2 - mean_fg ** 2)
+        std_fg = np.sqrt(mean_fg2)
 
         return {
-            "mean_x": mean_x,
-            "mean_y": mean_y,
-            "mean_r": mean_r,
-            "std_fg": std_fg,
+            'mean_x': mean_x,
+            'mean_y': mean_y,
+            'mean_r': mean_r,
+            'std_fg': std_fg,
         }
         
+    def rotate_complex(z, theta):
+        return z * np.exp(-1j * theta)
+    
     def _compute_force_phase(self, data, debug_mode=False):
         """Compute force magnitue and phase dependent components."""
         
-        y_trap = self.a * np.sqrt(2) * data['std_fg'] + self.b #? a and b are in nm
+        y_trap = self.a * np.sqrt(2) * data['std_fg'] + self.b # ! a and b are in nm
         A = self.ky * y_trap * 1e-9
         
         B = -self.ky * data['mean_r']
@@ -282,8 +360,9 @@ class LockinAnalysis(OTDataset):
             results.update({'phi': phi, 'x': data['mean_x'], 'y': data['mean_y']})
             
             plt.figure()
-            plt.plot(A, '.', label='trap')
-            plt.plot(B, '.', label='bead')
+            plt.plot(data['fg_freq'], A, '.', label='trap')
+            plt.plot(data['fg_freq'], B, '.', label='bead')
+            plt.xscale('log')
             plt.legend()
             plt.show()
             

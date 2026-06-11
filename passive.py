@@ -2,12 +2,36 @@ from typing_extensions import deprecated
 from microrheo.base import OTDataset
 from microrheo.utils import *
 
-from scipy.interpolate import interp1d
+from scipy.signal import savgol_filter
+from numpy.polynomial import Polynomial
+from scipy.interpolate import UnivariateSpline
 
-class PassiveAnalysis(OTDataset): # inheritance, with OTDataset = parent, PassiveAnalysis = child
-    '''Class for processing passive OT datasets'''
+class PassiveAnalysis(OTDataset):
+    """Process passive microrheology datasets.
+
+    Typical workflow::
+
+        passive = PassiveAnalysis(name, fh, analysisparams)
+        passive.compute_msd()
+        passive.compute_alpha(show_plots=True, degree=10)
+        passive.compute_moduli(trap=True, free_memory=False)
+        passive.plot_g1g2()
+    """
+
     def __init__(self, name, fh, analysisparams, params=None):
-        '''fh: file handle for where brownian folder can be found, subhandle: relative file handle of the passive dataset i.e. bead1p/'''
+        """Initialize a passive microrheology analysis object
+
+        Parameters
+        ---------
+        name : str
+            Human readable display name
+        fh : str
+            Relative file handle of the passive dataset i.e. 2600608/bead1p
+        aalysisparams : dict
+            Analysis configuration
+        params : optional
+            If provided, skips computing the Brownian power spectrum calibration and uses these parameters instead
+        """
         super().__init__(name, fh, analysisparams, params)
 
         self.analysisparams = analysisparams
@@ -15,9 +39,9 @@ class PassiveAnalysis(OTDataset): # inheritance, with OTDataset = parent, Passiv
         # Load the data, all in meters
         self.fh = fh +'/'
         self.x, self.y, self.sumsignal, self.fg = self._load_data(self.fh, analysisparams.data_starttime, analysisparams.data_endtime)
-        self.x/=self.Sx
-        self.y/=self.Sy
-        self.t = np.arange(len(self.x))*dt   # starts at zero
+        self.x /= self.Sx
+        self.y /= self.Sy
+        self.t = np.arange(len(self.x)) * dt   # starts at zero
 
         fig=plt.figure(figsize=(10, 5))
         fig.suptitle('Data to Analyze')
@@ -50,58 +74,77 @@ class PassiveAnalysis(OTDataset): # inheritance, with OTDataset = parent, Passiv
         return self.tau, self.msd
     
     def compute_alpha(self, degree=20, show_plots=False):
-        '''Compute log-log slope (alpha) by fitting a higher order polynomial, and other stuff ???'''
+        '''Compute log-log MSD slope (alpha) by fitting a higher order polynomial, and other stuff ???'''
                 
-        log_tau, log_msd = np.log10(self.tau), np.log10(self.msd)
+        logtau, logmsd = np.log10(self.tau[1:]), np.log10(self.msd[1:]) # skip first data point
         N = self.analysisparams.alphaincrement
         
-        logmsd_list, logtau_list, tau_list, msd_list, omega_list, alpha_list = [], [], [], [], [],[]
+        # remove any nans
+        logtau = logtau[~np.isnan(logtau)]
+        logmsd = logmsd[~np.isnan(logmsd)]
+                
+        window_size = 19 # must be odd
+        poly_deg = 2
+        # logmsd_smoothed = savgol_filter(logmsd[10:], window_size, polyorder=poly_deg) # skip first 10 datapoints due to sparcity of data
 
-        for i in np.arange(-5, 5 - N, N): # step through tau in increments of N
-          idx = (i < log_tau) & (log_tau < i + N)
-          logmsd_list.append(np.mean(log_msd[idx]))
-          logtau_list.append(((2 * i + N) / 2))
-          tau_list.append(np.mean(self.tau[idx]))
-          msd_list.append(np.mean(self.msd[idx]))
-          omega_list.append(1 / (10**logtau_list[-1]))
-
-        # clean NaNs with interpolation
-        index = ~np.isnan(msd_list)
-        logtau_list_filtered = np.array(logtau_list)[index]
-        logmsd_list_filtered = np.array(logmsd_list)[index]
-        omega_list_filtered = np.array(omega_list)[index]
-
-        #? there is likely no reason to be doing any interpolating to fill in the alpha steps
-        # index = (logtau_list > np.min(logtau_list_temp))*(logtau_list < np.max(logtau_list_temp))
-        # logtau_list = np.array(logtau_list)[index]
-        # f_interp = interp1d(logtau_list_temp, logmsd_list_temp, kind='linear') # or 'cubic'
-        # logmsd_list= f_interp(logtau_list)
-        # omega_list = np.array(omega_list)[index]
-        # msd_list = np.array(msd_list)[index]
-
-        # fit polynomial to MSD curve
-        X = logtau_list_filtered# - logtau_list_filtered[0]
+        logmsd_smoothed = non_uniform_savgol(logtau, logmsd, window_size, poly_deg) # skip first 10 datapoints due to sparcity of data
+        # logmsd_smoothed = np.concatenate((logmsd[:10], logmsd_smoothed)) # remerge with firt 10 datapoints of the raw data
         
-        coef = np.polyfit(X, logmsd_list_filtered, deg=degree)
-        poly_func = np.poly1d(coef)
-        derivative_func = np.polyder(poly_func)
+        poly_fit = Polynomial.fit(logtau, logmsd_smoothed, deg=degree)
+        poly_deriv = poly_fit.deriv(m=1)
+
+        # try it with a spline instead of a polynomial fit
+        # first, bin the data into logtau bins of size N, and take the mean logmsd in each bin
+        # logtau_bins = np.logspace(np.log10(logtau.min()), np.log10(logtau.max()), 512011) # logspace bins of size N
+        # logmsd_bins = np.zeros_like(logtau_bins)
+        # for i in range(len(logtau_bins)-1):
+        #     idx = (logtau >= logtau_bins[i]) & (logtau < logtau_bins[i+1])
+        #     logmsd_bins[i] = np.mean(logmsd[idx])
+        # logtau_bins = logtau_bins[:-1] + N/2 # convert to bin centers
+        # logmsd_bins = logmsd_bins[:-1] # remove last bin which is empty
+        # spline_fit = UnivariateSpline(logtau_bins, logmsd_bins, s=0.3)
+        # spline_deriv = spline_fit.derivative(n=1)
         
-        # calculate smoothed data
-        logmsd_list = np.polyval(coef, X)
-        msd_list = 10**logmsd_list
-        alpha_list = [derivative_func(x) for x in X]
-        
+        logtau_list = np.arange(logtau.min(), logtau.max(), N)
+        omega_list = 1 / (10**logtau_list)
+        logmsd_list = poly_fit(logtau_list)
+        msd_list = 10**(logmsd_list)
+        alpha_list = poly_deriv(logtau_list)
+
         if show_plots:
+            is_negative = alpha_list < 0
+
+            # use np.diff to identify True-False and False-True transitions
+            transitions = np.diff(is_negative.astype(int))
+            start_idxs = np.where(transitions == 1)[0] + 1
+            end_idxs = np.where(transitions == -1)[0]
+
             plt.figure()
-            plt.plot(X, logmsd_list_filtered, 'k.', label='Raw')
-            plt.plot(X, logmsd_list, color='tab:red', linestyle='solid', label='Fit')
+            # plt.plot(logtau_bins, logmsd_bins, 'mo', label="Binned Data")
+            for start, end in zip(start_idxs, end_idxs):
+                plt.axvspan(logtau_list[start], logtau_list[end], color='r', alpha=0.25, label='Negative Derivative' if start == start_idxs[0] else '')
+
+            plt.plot(logtau, logmsd, 'k.', label="Raw")
+            plt.plot(logtau, logmsd_smoothed, 'b--', label="Smoothed")
+            plt.plot(logtau_list, logmsd_list, 'r-', label="Fit")
+
+            # plt.plot(logtau_list, spline_fit(logtau_list), 'g-', label="Spline Fit")
+            plt.legend()
             plt.title('LogLog MSD')
             plt.xlabel('log(tau)')
             plt.ylabel('log(MSD)')
-            plt.legend()
+            plt.show()
+            
+            plt.figure()
+            plt.plot(logtau_list, alpha_list, color='tab:red', linestyle='solid')
+            for start, end in zip(start_idxs, end_idxs):
+                plt.axvspan(logtau_list[start], logtau_list[end], color='r', alpha=0.25, label='Negative Derivative' if start == start_idxs[0] else '')
+            plt.title('LogLog MSD Derivative')
+            plt.xlabel('log(tau)')
+            plt.ylabel('log(MSD)\'')
             plt.show()
         
-        self.logtau_list, self.logmsd_list, self.alpha_list, self.omega_list, self.msd_list = X, logmsd_list, alpha_list, omega_list_filtered, msd_list
+        self.logtau_list, self.logmsd_list, self.alpha_list, self.omega_list, self.msd_list = logtau_list, logmsd_list, alpha_list, omega_list, msd_list
         
         return self.logtau_list, self.logmsd_list, self.alpha_list, self.omega_list, self.msd_list
 
@@ -109,29 +152,34 @@ class PassiveAnalysis(OTDataset): # inheritance, with OTDataset = parent, Passiv
         '''Compute G' and G'' moduli'''
         
         d = 2 # dimensionality of the system
-        T = 293.15 # room temperature in K
-        K_B = 1.38064852e-23 # Boltzmann constant in J/K
 
         ktrap = (self.kx + self.ky)/2 # average trap stiffness
         offset = ktrap/(6*np.pi*ExperimentalConstants.r)
         
-        G1, G2 = [], []
-        for i in range(1, len(self.omega_list)):
-            gamma = (0.457*(1+self.alpha_list[i])**2) - (1.36*(1+self.alpha_list[i])) + 1.9 #approx value from Mason 2000 p.373 below eqn. 8
-            Gstar = abs((2*d*K_B*T)/(6*np.pi*ExperimentalConstants.r*self.msd_list[i]*gamma))
-            G1temp = Gstar*np.cos(self.alpha_list[i]*np.pi/2)
-            G2temp = Gstar*np.sin(self.alpha_list[i]*np.pi/2)
-            if trap: #if the trap was on, we need to subract its forces on the bead
-                G1temp -= offset
-            G1.append(G1temp)
-            G2.append(G2temp)
+        # G1, G2 = [], []
+        # for i in range(0, len(self.omega_list)):
+        #     gamma = (0.457*(1+self.alpha_list[i])**2) - (1.36*(1+self.alpha_list[i])) + 1.9 #approx value from Mason 2000 p.373 below eqn. 8
+        #     Gstar = np.abs((2*d*K_B*T)/(6*np.pi*ExperimentalConstants.r*self.msd_list[i]*gamma))
+        #     G1temp = Gstar*np.cos(self.alpha_list[i]*np.pi/2)
+        #     G2temp = Gstar*np.sin(self.alpha_list[i]*np.pi/2)
+        #     if trap: #if the trap was on, we need to subract its forces on the bead
+        #         G1temp -= offset
+        #     G1.append(G1temp)
+        #     G2.append(G2temp)
+
+        gamma = (0.457 * ( 1 + self.alpha_list)**2) - (1.36 * (1 + self.alpha_list)) + 1.9 #approx value from Mason 2000 p.373 below eqn. 8
+        G_star = np.abs((2 * d * kBT) / (6 * np.pi * ExperimentalConstants.r * self.msd_list * gamma))
+        G1 = G_star * np.cos(self.alpha_list * np.pi / 2)
+        G2 = G_star * np.sin(self.alpha_list * np.pi / 2)
+        if trap: # if the trap was on, we need to subract its forces on the bead
+            G1 -= offset
             
         if free_memory:
             self.logtau_list, self.logmsd_list, self.alpha_list, self.msd_list = None, None, None, None
 
         self.G1 = np.array(G1)
         self.G2 = np.array(G2)
-        self.omega_list = np.array(self.omega_list[1:])
+        self.omega_list = np.array(self.omega_list)
         
         return self.omega_list, self.G1, self.G2
 
