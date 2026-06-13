@@ -14,26 +14,23 @@ class LockinAnalysis(OTDataset):
         active.plot_g1g2()
     """
 
-    def __init__(self, name, fh, analysisparams, params=None):
+    def __init__(self, fh, constants, calib):
         """
         Parameters
         ----------
-        name : str
-            Human readable display name
         fh : str
-            Path to the active lock-in dataset directory (no trailing slash!)
-        aalysisparams : dict
-            Analysis configuration
-        params : optional
-            If provided, skips computing the Brownian power spectrum calibration and uses these parameters instead
+            Relative path to the active lock-in dataset directory
+        calib : TrapCalibration
+            Brownian and FunctionG calibration parameters
         """
-        super().__init__(name, fh, analysisparams, params)
+        super().__init__(fh, constants, calib)
         
-        self.analysisparams = analysisparams
-
         # Load the data
         self.fh = fh +'/'
-        self.data_dict = self._load_lockin_data(fh)
+        self.data_dict = load_lockin_data(fh)
+
+        for data in self.data_dict.values():
+                data['bead_y'] = 1e-9 * self.calib.ed_fit_func(data['bead_y'] - self.calib.v_offset)
             
     def analyze_trial(self, data:dict, show_plots=False, debug_mode=False) -> dict:
         """Segment a signal trail by frequency and return per-chunk statistics"""
@@ -42,7 +39,7 @@ class LockinAnalysis(OTDataset):
 
         chunk_info = self._segment_chunks(data, dom_freqs, change_idxs)
              
-        means = self._compute_chunk_means(data, chunk_info)
+        means = self._compute_chunk_means(data, chunk_info, debug_mode)
         
         means['fg_freq'] = chunk_info['fg_freq']
 
@@ -65,6 +62,8 @@ class LockinAnalysis(OTDataset):
         
         trials = {
             k: np.concatenate([res[k] for res in trial_info])
+            if k != 'bead_y' and k != 'fg'
+            else [b for res in trial_info for b in res[k]]
             for k in keys
         }
         
@@ -82,7 +81,8 @@ class LockinAnalysis(OTDataset):
         trials['mean_y'] -= y_ref
         
         # R magnitude must be recomputed from the zeroed X and Y values
-        mean_r = np.sqrt(trials['mean_x'] ** 2 + trials['mean_y'] ** 2) * np.sqrt(2)
+        mean_r = np.sqrt(trials['mean_x'] ** 2 + trials['mean_y'] ** 2)
+        trials['mean_r'] = 1e-9 * self.calib.ed_fit_func(mean_r)
 
         snr_r = mean_r / (np.std(mean_r) + 1e-12)
         trials['snr_r'] = snr_r
@@ -106,8 +106,6 @@ class LockinAnalysis(OTDataset):
             plt.ylabel("Bead SNR")
             plt.xlabel("Frequency")
             plt.show()
-
-        trials['mean_r'] = 1e-9 * self.ed_fit_func(mean_r)
         
         self.results = self._compute_force_phase(trials, debug_mode=debug_mode)
                     
@@ -223,7 +221,7 @@ class LockinAnalysis(OTDataset):
         
         return dom_freqs, merged_boundaries
             
-    def compute_moduli(self, free_memory=False, debug_mode=False):
+    def compute_moduli(self, free_memory=True, debug_mode=False):
         """Compute the shear moduli G' and G" from the active microrheology results."""
         freq_list = self.results["fg_freq"]
         ynot = self.results["ynot"]
@@ -235,8 +233,8 @@ class LockinAnalysis(OTDataset):
             x = self.results['x']
             y = self.results['y']            
                 
-        G1 = np.abs(fnot / (6 * np.pi * ExperimentalConstants.r * ynot)) * np.cos(delta)
-        G2 = np.abs(fnot / (6 * np.pi * ExperimentalConstants.r * ynot)) * np.sin(delta)
+        G1 = np.abs(fnot / (6 * np.pi * self.constants.r * ynot)) * np.cos(delta)
+        G2 = np.abs(fnot / (6 * np.pi * self.constants.r * ynot)) * np.sin(delta)
                
         if debug_mode:                         
             plt.figure()
@@ -258,15 +256,6 @@ class LockinAnalysis(OTDataset):
         self.G1 = G1
         self.G2 = G2
         self.omega_list = 2*np.pi * freq_list
-
-    def plot_g1g2(self):
-        """Create the shear moduli plot."""
-        plt.figure()
-        plt.loglog(self.omega_list, self.G1, 'k.', label='G\'')
-        plt.loglog(self.omega_list, self.G2, 'r.', label='G\'\'')
-        plt.xlabel('Angular Frequency (Radians)')
-        plt.ylabel('Viscoelastic Moduli (Pa)')
-        plt.legend()
         
     def _segment_chunks(self, data, dom_freqs, change_idxs):
         """Create chunk ids and valid mask after equilibration masking."""
@@ -306,7 +295,7 @@ class LockinAnalysis(OTDataset):
             'fg_freq': fg_freq
         }
 
-    def _compute_chunk_means(self, data, chunk_info):
+    def _compute_chunk_means(self, data, chunk_info, debug_mode):
         """Compute chunk average X, Y, R, and fg statistics per trial."""
                 
         mask = chunk_info['valid_mask']
@@ -317,32 +306,54 @@ class LockinAnalysis(OTDataset):
                                         
         mean_x = np.bincount(cid, data['x'][mask], minlength=n_chunks) / counts
         mean_y = np.bincount(cid, data['y'][mask], minlength=n_chunks) / counts
-        mean_r = np.bincount(cid, data['r'][mask], minlength=n_chunks) / counts
+        
+        split_idxs = np.flatnonzero(np.diff(cid)) + 1 # locates where the chunk id's change (ex. 1 -> 2)
+        bead_y = np.split(data['bead_y'][mask], split_idxs)
 
         fg_valid = data['fg'][mask]
         mean_fg = np.bincount(cid, weights=fg_valid, minlength=n_chunks) / counts
         mean_fg2 = np.bincount(cid, weights=fg_valid**2, minlength=n_chunks) / counts - mean_fg ** 2
 
+        fg = np.split(data['fg'][mask], split_idxs)
+
         std_fg = np.sqrt(mean_fg2)
 
-        return {
+        result = {
             'mean_x': mean_x,
             'mean_y': mean_y,
-            'mean_r': mean_r,
+            'bead_y': bead_y,
             'std_fg': std_fg,
         }
-        
-    def rotate_complex(z, theta):
-        return z * np.exp(-1j * theta)
+
+        if debug_mode:
+            result['fg'] = fg
+
+        return result
     
+    def _software_phi(self, bead, fg, f):
+        """Bead phase relative to FG via software demodulation."""
+        t        = np.arange(len(bead)) * dt
+        bead     = bead - np.mean(bead)
+        fg       = fg   - np.mean(fg)
+        cos_ref  = np.cos(2 * np.pi * f * t)
+        sin_ref  = np.sin(2 * np.pi * f * t)
+        Xb, Yb   = np.mean(bead * cos_ref), np.mean(bead * sin_ref)
+        Xf, Yf   = np.mean(fg   * cos_ref), np.mean(fg   * sin_ref)
+        return np.arctan2(Yb*Xf - Xb*Yf, Xb*Xf + Yb*Yf)
+
     def _compute_force_phase(self, data, debug_mode=False):
         """Compute force magnitue and phase dependent components."""
         
-        y_trap = self.a * np.sqrt(2) * data['std_fg'] + self.b # ! a and b are in nm
-        A = self.ky * y_trap * 1e-9
+        y_trap = self.calib.a * np.sqrt(2) * data['std_fg'] + self.calib.b # ! a and b are in nm
+        A = self.calib.ky * y_trap * 1e-9
         
-        B = -self.ky * data['mean_r']
-        phi = np.arctan2(data['mean_y'], data['mean_x'])
+        B = -self.calib.ky * data['mean_r']
+
+        phi = np.array([                                                   # bead phase vs FG (software, reliable)
+            self._software_phi(data['bead_y'][i], data['fg'][i], data['fg_freq'][i])
+            for i in range(len(data['fg_freq']))
+        ])
+        # phi = np.arctan2(data['mean_y'], data['mean_x'])
         
         C = np.sqrt(A**2 + B**2 + 2 * A * B * np.cos(phi))
         phi_new = np.arctan2(B * np.sin(phi), A + B * np.cos(phi))
@@ -357,7 +368,7 @@ class LockinAnalysis(OTDataset):
         }
         
         if debug_mode:
-            results.update({'phi': phi, 'x': data['mean_x'], 'y': data['mean_y']})
+            results.update({'phi': phi, 'x': data['mean_x'], 'y': data['mean_y'], 'bead_y': data['bead_y'], 'fg': data['fg']})
             
             plt.figure()
             plt.plot(data['fg_freq'], A, '.', label='trap')
@@ -367,3 +378,15 @@ class LockinAnalysis(OTDataset):
             plt.show()
             
         return results
+    
+    def plot_g1g2(self):
+        """Create the shear moduli plot."""
+        plt.figure()
+        plt.loglog(self.omega_list, self.G1, 'k.', label='G\'')
+        plt.loglog(self.omega_list, self.G2, 'r.', label='G\'\'')
+        plt.xlabel('Angular Frequency (Radians)')
+        plt.ylabel('Viscoelastic Moduli (Pa)')
+        plt.legend()
+        plt.title('Viscoelastic Shear Moduli G\', G\"')
+        plt.tight_layout()
+        plt.show()

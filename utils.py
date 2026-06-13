@@ -2,70 +2,18 @@ from matplotlib import pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy import signal
-import scipy
-
-from dataclasses import dataclass, field
+import scipy.fft
+import os
 
 plt.style.use('default')
 
-# ---------- CONSTANTS ----------
+# ---------- CONSTANTS ---------- # ? maybe move these into the ExperimentalConstants dataclass?
 
 fs = 50000                  # data collection rate
 dt = 1/fs         
 kBT = 4.11e-21              # room temp (J)
 
-# viscosity presets Pa s
-PRESET_ETA = {
-    "water": 0.001,
-    "bsa":   0.002548,
-    "iodixinol20": 0.001856,
-}
-
-# helper class to store analysis parameters
-@dataclass
-class CalibrationParams:
-    starttime: int = 0
-    endtime: int = 120
-    startfreqx: int = 20
-    endfreqx: int = 5000
-    startfreqy: int = 20
-    endfreqy: int = 5000
-    fg_starttime: int = 0
-    fg_endtime: int = 200
-    chunk_dur: float = 1.0
-
-@dataclass
-class AnalysisParams:
-    calib: CalibrationParams = field(default_factory=CalibrationParams)
-    data_starttime: int = 0
-    data_endtime: int = 300
-    alphaincrement: float = 0.001
-
-# ---------- UTILITY FUNCTIONS ----------
-
-class ExperimentalConstants:
-    
-    eta = None
-    D = None            # diffusion constant
-    beta = None
-    r = None            # bead radius (m)
-    
-    @classmethod
-    def init(cls, arg='iodixinol20', bead_dia=2.0e-6):
-        """Initialize constants; call once per experiment."""
-        if isinstance(arg, str):
-            if arg not in PRESET_ETA:
-                raise ValueError(f'Preset \'{arg}\' not recognized. Choose from {list(PRESET_ETA)} or custom float')
-            cls.eta = PRESET_ETA[arg]
-        elif isinstance(arg, float):
-            cls.eta = arg
-        else:
-            raise ValueError(f'Input \'{arg}\' not recognized.')
-        
-        cls.r = bead_dia / 2
-        cls.D = kBT /(6 * np.pi * cls.eta * cls.r)
-        cls.beta = 6 * np.pi * cls.eta * cls.r
-        
+# ---------- UTILITY FUNCTIONS ----------        
 def rw(data, window_size):
   df = pd.DataFrame({'value': data})
   rollingwindow = np.array((df['value'].rolling(window=window_size).mean()))
@@ -82,11 +30,6 @@ def openfile(filename):   # open files
 def calcpowerspec2(data):    # Calculate power spectrum
     f, Pxx_den = signal.welch(data, fs,  nperseg=int(len(data)), window='hamming')
     return f, Pxx_den
-
-def func(x, a, b):    # fitting function for the PSD
-    return a**2*(ExperimentalConstants.D/((np.pi)**2)) / ( (b/(2*np.pi*ExperimentalConstants.beta))**2 + x**2) # from eqn 10 Berg-Sorensen et al. 2004
-       # a - Sensitivity - units of V/m
-       # b - Stiffness - N/m
 
 def autocorrFFT(x):     # used by the program that calculates the meansquared displacement
     N=len(x)
@@ -155,6 +98,130 @@ def calcmsd2(x, y, analysislength, msdlength, silent=False):
         plt.show()
         
     return msdvalues
+
+def load_data(fh:str, starttime, endtime, return_power_spectrum:bool=False, chunk_dur=1.0) -> tuple[np.array, np.array, np.array, np.array]:
+    """Load the data from file, concatenate it and return it as a tuple of arrays
+    Optionally return the power spectrum of the data as well
+
+    Parameters
+    ----------
+    fh: str
+        File handle
+    return_power_spectrum: bool = False 
+        whether to return the power spectrum of the data or not
+    chunk_dur: float = 1.0
+        duration of chunk size in seconds for power spectrum
+
+    Returns
+    -------
+    longdatax: np.array
+        x position data
+    longdatay: np.array
+        y position data
+    longdatasum: np.array
+        sum signal
+    longdatafg: np.array
+        function generator data
+    powerspecx: np.array
+        power spectrum of x position data
+    powerspecy: np.array
+        power spectrum of y position data
+    """
+    
+    file_sort = lambda s: int(s.split('_')[-1]) # slow?
+
+    longdatax = []
+    longdatay = []
+    longdatasum = []
+    longdatafg = []
+
+    fhs = sorted(os.listdir(fh), key=file_sort)
+    fhs = fhs[:-1] # remove the last file, as this causes errors
+    count = 0
+    for i, sh in enumerate(fhs):    # this is problematic, because it takes every data file; let's include a selection based on the time
+        dim = openfile(fh+sh)
+        datax = dim[0::4]
+        datay = dim[2::4]
+        datafg = dim[3::4]
+        datasum = dim[1::4]
+        for i in range(len(datax)):
+            longdatax.append(datax[i])
+            longdatay.append(datay[i])
+            longdatasum.append(datasum[i])
+            longdatafg.append(datafg[i])
+
+    longt = np.arange(len(longdatax))*dt
+    indexcut = (longt > starttime) * (longt < endtime)
+    longdatax = np.array(longdatax)[indexcut]
+    longdatay = np.array(longdatay)[indexcut]
+    longdatasum = np.array(longdatasum)[indexcut]
+    longdatafg = np.array(longdatafg)[indexcut]
+
+    if return_power_spectrum:
+        powerspecx = np.zeros(int(chunk_dur*fs//2+1))
+        powerspecy = np.zeros(int(chunk_dur*fs//2+1))
+        
+        for k in range(0, (len(longdatax)), int(chunk_dur*fs)):
+            if len(longdatax[k:int(k+chunk_dur*fs)]) == chunk_dur*fs:
+                dataxchunk = longdatax[k:int(k+chunk_dur*fs)]
+                dataychunk = longdatay[k:int(k+chunk_dur*fs)]
+                fx, Pxx_den = calcpowerspec2(dataxchunk)
+                powerspecx += Pxx_den
+                fy, Pyy_den = calcpowerspec2(dataychunk)
+                powerspecy += Pyy_den
+                count += 1
+        powerspecx = powerspecx/count
+        powerspecy = powerspecy/count
+
+        return np.array(longdatax), np.array(longdatay), np.array(longdatasum), np.array(longdatafg), fx, powerspecx, powerspecy
+
+    return np.array(longdatax), np.array(longdatay), np.array(longdatasum), np.array(longdatafg)
+
+def load_lockin_data(fh:str, folders=None) -> dict:
+    """Load the data recorded from the lock-in and return it as a dictionary structured as,
+    {
+        [folder1_name]: {
+            'x':  [x_data...],
+            'y':  [y_data...],
+            'r':  [r_data...],
+            'fg': [fg_data...],
+        },
+        
+        [folder2_name]:
+        ...
+    }
+    """
+    
+    data_dict = {}
+    
+    file_sort = lambda s: int(s.split('_')[-1])
+    
+    if folders is None:
+        folders = [f for f in os.listdir(fh) if os.path.isdir(os.path.join(fh, f))]
+        
+    for folder in folders:
+        folder_path = os.path.join(fh, folder)
+        x, y, bead_y, fg = [], [], [], []
+        
+        files = sorted(os.listdir(folder_path), key=file_sort)[:-1]
+        
+        if not files: continue # skip empty folders
+
+        for file in files:
+            dim = openfile(os.path.join(folder_path, file))
+            x.extend(dim[1::4])
+            y.extend(dim[2::4])
+            bead_y.extend(dim[3::4])
+            fg.extend(dim[0::4])
+
+        data_dict[folder] = {
+            'x':  np.array(x),
+            'y':  np.array(y),
+            'bead_y':  np.array(bead_y),
+            'fg': np.array(fg)
+            }
+
+    return data_dict
 
 def non_uniform_savgol(x, y, window, polynom):
     """
