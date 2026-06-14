@@ -45,25 +45,47 @@ class LockinAnalysis(OTDataset):
 
         means['fg_freq'][means['fg_freq'] == 0] = 50000 # manually set zero to the largest value since it isn't computed correctly by the SFFT
                 
-        return means, chunk_info
+        return means
         
     def analyze_all_trials(self, show_plots=False, debug_mode=False) -> dict:
         """Run 'analyze_trial' over every trial and assemble the rheological results"""
         
-        trial_outputs = [
-            self.analyze_trial(self.data_dict[trial], show_plots=show_plots, debug_mode=debug_mode) 
-            for trial in self.data_dict
-        ]
+        if show_plots:
+            fig, axs = plt.subplots(1, 3, figsize=(14, 4.8))
 
-        trial_info, chunk_infos = zip(*trial_outputs)
+        trial_outputs = []
+        for ax, (trial_name, trial_data) in zip(axs, self.data_dict.items()):
+            dom_freqs, change_idxs = self.compute_freq_changes_sfft(trial_data['fg'], show_plots=show_plots)
+
+            chunk_info = self._segment_chunks(trial_data, dom_freqs, change_idxs)
+
+            means = self._compute_chunk_means(trial_data, chunk_info, debug_mode)
+        
+            means['fg_freq'] = chunk_info['fg_freq']
+
+            means['fg_freq'][means['fg_freq'] == 0] = 50000 # manually set zero to the largest value since it isn't computed correctly by the SFFT
+            trial_outputs.append(means)
+
+            if show_plots:
+                ax.plot(dom_freqs, marker='.', label='Dominant Frequencies')
+                mid_idx = (change_idxs[:-1] + change_idxs[1:] - 1) // 2
+                [ax.text(i, dom_freqs[i]*1.01, f"{dom_freqs[i]:.0f}", ha='center', va='bottom') for i in mid_idx]
+                ax.set_title(f"{trial_name}")
+        
+        if show_plots:
+            fig.suptitle('Dominant Frequency Per Chunk')
+            fig.supxlabel("Chunk Index")
+            axs[0].set_ylabel("Frequency (Hz)")
+            plt.tight_layout()
+            plt.show()
         
         # Concatenate dict-of-arrays into one dict
-        keys = trial_info[0].keys()
+        keys = trial_outputs[0].keys()
         
         trials = {
-            k: np.concatenate([res[k] for res in trial_info])
+            k: np.concatenate([res[k] for res in trial_outputs])
             if k != 'bead_y' and k != 'fg'
-            else [b for res in trial_info for b in res[k]]
+            else [b for res in trial_outputs for b in res[k]]
             for k in keys
         }
         
@@ -75,8 +97,6 @@ class LockinAnalysis(OTDataset):
         x_ref = trials['mean_x'][idx_ref]
         y_ref = trials['mean_y'][idx_ref]
 
-        print(f"Lockin Offset: ({x_ref},{y_ref})")
-
         trials['mean_x'] -= x_ref
         trials['mean_y'] -= y_ref
         
@@ -84,27 +104,19 @@ class LockinAnalysis(OTDataset):
         mean_r = np.sqrt(trials['mean_x'] ** 2 + trials['mean_y'] ** 2)
         trials['mean_r'] = 1e-9 * self.calib.ed_fit_func(mean_r)
 
-        snr_r = mean_r / (np.std(mean_r) + 1e-12)
-        trials['snr_r'] = snr_r
-
         if show_plots:
             plt.figure()
             plt.plot(trials['fg_freq'], trials['mean_x'], 'b.', label='X')
             plt.plot(trials['fg_freq'], trials['mean_y'], 'g.', label='Y')
             plt.plot(trials['fg_freq'], mean_r, 'r.', label=r'$\sqrt{X^2+Y^2}$')
             plt.axhline(0, color='r', linestyle='--')
+            plt.text(0.9*trials['fg_freq'].max(), np.median(mean_r)*1.05, f'X Offset: {x_ref: .2e}', ha='right', va='bottom', color='k', alpha=0.8)
+            plt.text(0.9*trials['fg_freq'].max(), np.median(mean_r)*0.995, f'Y Offset: {y_ref: .2e}', ha='right', va='top', color='k', alpha=0.8)
             plt.ylabel('Lockin (V)')
             plt.xlabel('Freq (Hz)')
             plt.xscale('log')
             plt.legend()
             plt.title('X, Y, R Data')
-            plt.show()
-
-            plt.figure()
-            plt.semilogx(trials['fg_freq'], snr_r, '.')
-            plt.axhline(2, linestyle='--')
-            plt.ylabel("Bead SNR")
-            plt.xlabel("Frequency")
             plt.show()
         
         self.results = self._compute_force_phase(trials, debug_mode=debug_mode)
@@ -185,7 +197,7 @@ class LockinAnalysis(OTDataset):
         keep = chunk_sizes > 1 # only keep freq chunks with more then one sample to remove mid transition values
         boundaries = np.concatenate(([boundaries[0]], boundaries[1:][keep]))
 
-        merged_boundaries = [boundaries[0]]
+        merged_boundaries = [boundaries[0]] # merge neighboring chunks with the same frequency
         for i in range(1, len(boundaries) - 1):
             prev_start, prev_end = merged_boundaries[-1], boundaries[i]
             curr_end = boundaries[i + 1]
@@ -208,17 +220,7 @@ class LockinAnalysis(OTDataset):
         # include the final boundary
         merged_boundaries.append(boundaries[-1])
         merged_boundaries = np.array(merged_boundaries)
-                        
-        if show_plots:
-            plt.figure()
-            plt.plot(dom_freqs, marker='.', label='Dominant Frequencies')
-            mid_idx = (merged_boundaries[:-1] + merged_boundaries[1:] - 1) // 2
-            [plt.text(i, dom_freqs[i], f"{dom_freqs[i]:.0f}", ha='center') for i in mid_idx]
-            plt.title("Dominant Frequency Per Chunk")
-            plt.xlabel("Chunk Index")
-            plt.ylabel("Frequency (Hz)")
-            plt.show()
-        
+                                
         return dom_freqs, merged_boundaries
             
     def compute_moduli(self, free_memory=True, debug_mode=False):
@@ -331,29 +333,31 @@ class LockinAnalysis(OTDataset):
         return result
     
     def _software_phi(self, bead, fg, f):
-        """Bead phase relative to FG via software demodulation."""
-        t        = np.arange(len(bead)) * dt
-        bead     = bead - np.mean(bead)
-        fg       = fg   - np.mean(fg)
-        cos_ref  = np.cos(2 * np.pi * f * t)
-        sin_ref  = np.sin(2 * np.pi * f * t)
-        Xb, Yb   = np.mean(bead * cos_ref), np.mean(bead * sin_ref)
-        Xf, Yf   = np.mean(fg   * cos_ref), np.mean(fg   * sin_ref)
+        """Bead phase relative to FG via software demodulation"""
+        t = np.arange(len(bead)) * dt
+        bead = bead - np.mean(bead)
+        fg = fg - np.mean(fg)
+
+        cos_ref = np.cos(2 * np.pi * f * t)
+        sin_ref = np.sin(2 * np.pi * f * t)
+
+        Xb, Yb = np.mean(bead * cos_ref), np.mean(bead * sin_ref)
+        Xf, Yf = np.mean(fg   * cos_ref), np.mean(fg   * sin_ref)
+
         return np.arctan2(Yb*Xf - Xb*Yf, Xb*Xf + Yb*Yf)
 
     def _compute_force_phase(self, data, debug_mode=False):
-        """Compute force magnitue and phase dependent components."""
+        """Compute force magnitue and phase dependent components"""
         
         y_trap = self.calib.a * np.sqrt(2) * data['std_fg'] + self.calib.b # ! a and b are in nm
         A = self.calib.ky * y_trap * 1e-9
         
         B = -self.calib.ky * data['mean_r']
 
-        phi = np.array([                                                   # bead phase vs FG (software, reliable)
+        phi = np.array([
             self._software_phi(data['bead_y'][i], data['fg'][i], data['fg_freq'][i])
             for i in range(len(data['fg_freq']))
         ])
-        # phi = np.arctan2(data['mean_y'], data['mean_x'])
         
         C = np.sqrt(A**2 + B**2 + 2 * A * B * np.cos(phi))
         phi_new = np.arctan2(B * np.sin(phi), A + B * np.cos(phi))
@@ -369,14 +373,7 @@ class LockinAnalysis(OTDataset):
         
         if debug_mode:
             results.update({'phi': phi, 'x': data['mean_x'], 'y': data['mean_y'], 'bead_y': data['bead_y'], 'fg': data['fg']})
-            
-            plt.figure()
-            plt.plot(data['fg_freq'], A, '.', label='trap')
-            plt.plot(data['fg_freq'], B, '.', label='bead')
-            plt.xscale('log')
-            plt.legend()
-            plt.show()
-            
+                        
         return results
     
     def plot_g1g2(self):

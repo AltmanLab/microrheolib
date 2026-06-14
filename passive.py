@@ -1,10 +1,7 @@
-from typing_extensions import deprecated
 from microrheo.base import OTDataset
 from microrheo.utils import *
 
-from scipy.signal import savgol_filter
-from numpy.polynomial import Polynomial
-from scipy.interpolate import UnivariateSpline
+from scipy.ndimage import gaussian_filter1d
 
 class PassiveAnalysis(OTDataset):
     """Process passive microrheology datasets.
@@ -18,7 +15,7 @@ class PassiveAnalysis(OTDataset):
         passive.plot_g1g2()
     """
 
-    def __init__(self, fh, constants, calib, starttime=0, endtime=185, alphaincrement=0.1):
+    def __init__(self, fh, constants, calib, starttime=0, endtime=185):
         """Initialize a passive microrheology analysis object
 
         Parameters
@@ -38,7 +35,6 @@ class PassiveAnalysis(OTDataset):
         self.x /= self.calib.Sx
         self.y = 1e-9 * self.calib.ed_fit_func(self.y - self.calib.v_offset)
         self.t = np.arange(len(self.x)) * dt   # starts at zero
-        self.alphaincrement = alphaincrement
 
         fig=plt.figure(figsize=(10, 5))
         fig.suptitle('Data to Analyze')
@@ -51,47 +47,89 @@ class PassiveAnalysis(OTDataset):
         ypos.set_xlabel('Time [s]')
         plt.plot()
         
-    def compute_msd(self, max_tau=20, analsis_length=20, show_plots=False):
+    def compute_msd(self, max_tau=20, analysis_length=20, show_plots=False):
         '''Compute msd and tau arrays
-        Args:
-        max_tau: max value for tau (seconds)
-        analysis_length: ???
-        returns: tau, msd
+        
+        Parameters
+        ----------
+        max_tau: float
+            Max value for tau (seconds)
+        analysis_length: float
+            Duration in seconds to trim the MSD to
+        show_plots : bool
+
+        Returns
+        -------
+        tau : np.ndarray
+            timescale
+        msd : np.ndarray
+            mean squared displacement
         '''
         
-        msd_df:pd.DataFrame = calcmsd2(self.x, self.y, self.t[-1], max_tau, not show_plots)
-        msd = msd_df.msd[:int(analsis_length*fs)].to_numpy()
-        tau = msd_df.tau[:int(analsis_length*fs)].to_numpy()
-        
-        # mask = np.isnan(tau) | np.isnan(msd) # remove nan values
-        # return tau[~mask], msd[~mask]
+        tau, msd = calcmsd2(self.x, self.y, self.t[-1], max_tau, not show_plots)
+        msd = msd[:int(analysis_length*fs)]
+        tau = tau[:int(analysis_length*fs)]
+
+        mask = np.isfinite(tau) & np.isfinite(msd)
+        tau, msd = tau[mask], msd[mask]
+
         self.tau, self.msd = tau, msd
         return self.tau, self.msd
     
-    def compute_alpha(self, degree=10, show_plots=True):
-        """Compute log-log MSD slope (alpha) by fitting a higher order polynomial"""
+    def compute_alpha(self, n_points=500, sigma=25, show_plots=True):
+        """Compute log-log MSD slope (alpha) using log-spacing binning and spline fitting
+        
+        Parameters
+        ---------
+        n_points : int
+            Number of log-spaced points to resample the data at
+        sigma : int
+            Smoothing parameter passed to the gaussian filter. Nominally around 5% of `n_points`
+        """
                 
-        logtau, logmsd = np.log10(self.tau), np.log10(self.msd) # skip first data point
+        logtau, logmsd = np.log10(self.tau), np.log10(self.msd)
         
         # remove any nans/infs
-        mask = np.isfinite(logtau) & np.isfinite(logmsd)
+        mask = np.isfinite(logtau) & np.isfinite(logmsd) & logtau > 0 & logmsd > 0
         logtau, logmsd = logtau[mask], logmsd[mask]
-                
-        window_size = 19 # must be odd
-        poly_deg = 2
-        # logmsd_smoothed = savgol_filter(logmsd[10:], window_size, polyorder=poly_deg) # skip first 10 datapoints due to sparcity of data
 
-        logmsd_smoothed = non_uniform_savgol(logtau, logmsd, window_size, poly_deg)
-        # logmsd_smoothed = np.concatenate((logmsd[:10], logmsd_smoothed)) # remerge with firt 10 datapoints of the raw data
-
-        poly_fit = Polynomial.fit(logtau, logmsd_smoothed, deg=degree)
-        poly_deriv = poly_fit.deriv(m=1)
+        # sort
+        sort_idxs = np.argsort(logtau)
+        logtau, logmsd = logtau[sort_idxs], logmsd[sort_idxs]
         
-        logtau_list = np.arange(logtau.min(), logtau.max(), N)
-        omega_list = 1 / (10**logtau_list)
-        logmsd_list = poly_fit(logtau_list)
-        msd_list = 10**(logmsd_list)
-        alpha_list = poly_deriv(logtau_list)
+        # resamble the points to equally space them in logspace
+        logtau_rs = np.linspace(logtau.min(), logtau.max(), n_points)
+        logmsd_rs = np.interp(logtau_rs, logtau, logmsd) # linear interp in log-log space
+
+        # remove any potentally overlapping points (must be monotonic)
+        logtau_rs, uniq_idxs = np.unique(logtau_rs, return_index=True)
+        logmsd_rs = logmsd_rs[uniq_idxs]
+
+        # remove any nans/infs
+        mask = np.isfinite(logtau_rs) & np.isfinite(logmsd_rs)
+        logtau_rs, logmsd_rs = logtau_rs[mask], logmsd_rs[mask]
+
+        delta = logtau_rs[1] - logtau_rs[0]
+        n_pad = 4 * sigma # add enough padding to cover the filter's edges
+        n_local = max(10, len(logtau_rs) // 10) # use the first 10% of the data to capture the local slope at the edge
+
+        left_slope = np.polyfit(logtau_rs[:n_local], logmsd_rs[:n_local], 1)[0]
+        right_slope = np.polyfit(logtau_rs[-n_local:], logmsd_rs[-n_local:], 1)[0]
+
+        pad_steps_l = np.arange(-n_pad, 0) * delta
+        pad_logmsd_l = logmsd_rs[0] + left_slope * pad_steps_l
+
+        pad_steps_r = np.arange(1, n_pad + 1) * delta
+        pad_logmsd_r = logmsd_rs[-1] + right_slope * pad_steps_r
+
+        logmsd_padded = np.concatenate([pad_logmsd_l, logmsd_rs, pad_logmsd_r])
+        logmsd_smooth = gaussian_filter1d(logmsd_padded, sigma)
+        logmsd_smooth = logmsd_smooth[n_pad:-n_pad]
+
+        alpha_list = np.gradient(logmsd_smooth, delta)
+
+        omega_list = 1 / (10**logtau_rs)
+        msd_list = 10**(logmsd_smooth)
 
         if show_plots:
             is_negative = alpha_list < 0
@@ -101,30 +139,31 @@ class PassiveAnalysis(OTDataset):
             start_idxs = np.where(transitions == 1)[0] + 1
             end_idxs = np.where(transitions == -1)[0]
 
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.8), tight_layout=True)
-            # plt.plot(logtau_bins, logmsd_bins, 'mo', label="Binned Data")
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5), tight_layout=True)
             for start, end in zip(start_idxs, end_idxs):
-                plt.axvspan(logtau_list[start], logtau_list[end], color='r', alpha=0.25, label='Negative Derivative' if start == start_idxs[0] else '')
+                ax1.axvspan(logtau_rs[start], logtau_rs[end], color='r', alpha=0.25, label='Negative Derivative' if start == start_idxs[0] else '')
 
-            ax1.plot(logtau, logmsd, 'k.', label="Raw")
-            ax1.plot(logtau, logmsd_smoothed, 'b--', label="Smoothed")
-            ax1.plot(logtau_list, logmsd_list, 'r-', label="Fit")
+            ax1.plot(logtau, logmsd, 'k.', ms=1, alpha=0.5, label='Raw')
+            ax1.plot(logtau_rs, logmsd_rs, 'mo', ms=3, label=f'Resampled Data (n={n_points})')
+            ax1.plot(logtau_rs, logmsd_smooth, 'r-', label='Spline Fit')
 
             ax1.legend()
             ax1.set_title('LogLog MSD')
             ax1.set_xlabel('log(tau)')
             ax1.set_ylabel('log(MSD)')
             
-            ax2.plot(logtau_list, alpha_list, 'r-', label='Spline')
-
             for start, end in zip(start_idxs, end_idxs):
-                ax2.axvspan(logtau_list[start], logtau_list[end], color='r', alpha=0.25, label='Negative Derivative' if start == start_idxs[0] else '')
-            ax2.set_title('LogLog MSD Derivative')
+                ax2.axvspan(logtau_rs[start], logtau_rs[end], color='r', alpha=0.25, label='Negative Derivative' if start == start_idxs[0] else '')
+            ax2.plot(logtau_rs, alpha_list, 'r-', label='Spline')
+            ax2.axhline(0, color='k', lw=0.8, ls='--')
+            ax2.axhline(1, color='b', lw=0.8, ls='--')
+            plt.text(0.9 * logtau_rs.max(), 1, 'diffusive', color='b', ha='right', va='bottom')
+            ax2.set_title(r'LogLog MSD Derivative ($\alpha$)')
             ax2.set_xlabel('log(tau)')
-            ax2.set_ylabel('log(MSD)\'')
+            ax2.set_ylabel(r'$\alpha = $ d log(MSD) / d log(tau)')
             plt.show()
         
-        self.logtau_list, self.logmsd_list, self.alpha_list, self.omega_list, self.msd_list = logtau_list, logmsd_list, alpha_list, omega_list, msd_list
+        self.logtau_list, self.logmsd_list, self.alpha_list, self.omega_list, self.msd_list = logtau_rs, logmsd_smooth, alpha_list, omega_list, msd_list
         
         return self.logtau_list, self.logmsd_list, self.alpha_list, self.omega_list, self.msd_list
 
