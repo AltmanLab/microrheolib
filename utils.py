@@ -13,13 +13,6 @@ dt = 1/fs
 kBT = 4.11e-21              # room temp (J)
 
 # ---------- UTILITY FUNCTIONS ----------        
-def rw(data, window_size):
-  df = pd.DataFrame({'value': data})
-  rollingwindow = np.array((df['value'].rolling(window=window_size).mean()))
-  #ewma_result = df.ewm(span=window_size, adjust=False).mean()
-  data = np.array(rollingwindow)
-  return data
-
 def openfile(filename):   # open files
         fid = open(filename, 'rb')
         dim = np.fromfile(fid, dtype='>d') # big-endian (google it lol) decimal

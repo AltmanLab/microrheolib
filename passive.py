@@ -70,7 +70,7 @@ class PassiveAnalysis(OTDataset):
         msd = msd[:int(analysis_length*fs)]
         tau = tau[:int(analysis_length*fs)]
 
-        mask = np.isfinite(tau) & np.isfinite(msd)
+        mask = np.isfinite(tau) & np.isfinite(msd) & (tau > 0) & (msd > 0)
         tau, msd = tau[mask], msd[mask]
 
         self.tau, self.msd = tau, msd
@@ -90,7 +90,7 @@ class PassiveAnalysis(OTDataset):
         logtau, logmsd = np.log10(self.tau), np.log10(self.msd)
         
         # remove any nans/infs
-        mask = np.isfinite(logtau) & np.isfinite(logmsd) & logtau > 0 & logmsd > 0
+        mask = np.isfinite(logtau) & np.isfinite(logmsd)
         logtau, logmsd = logtau[mask], logmsd[mask]
 
         # sort
@@ -128,6 +128,8 @@ class PassiveAnalysis(OTDataset):
 
         alpha_list = np.gradient(logmsd_smooth, delta)
 
+        alpha_list = gaussian_filter1d(alpha_list, sigma)
+
         omega_list = 1 / (10**logtau_rs)
         msd_list = 10**(logmsd_smooth)
 
@@ -145,7 +147,7 @@ class PassiveAnalysis(OTDataset):
 
             ax1.plot(logtau, logmsd, 'k.', ms=1, alpha=0.5, label='Raw')
             ax1.plot(logtau_rs, logmsd_rs, 'mo', ms=3, label=f'Resampled Data (n={n_points})')
-            ax1.plot(logtau_rs, logmsd_smooth, 'r-', label='Spline Fit')
+            ax1.plot(logtau_rs, logmsd_smooth, 'r-', label='Gaussian Smoothed')
 
             ax1.legend()
             ax1.set_title('LogLog MSD')

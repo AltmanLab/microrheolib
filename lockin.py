@@ -31,22 +31,7 @@ class LockinAnalysis(OTDataset):
 
         for data in self.data_dict.values():
                 data['bead_y'] = 1e-9 * self.calib.ed_fit_func(data['bead_y'] - self.calib.v_offset)
-            
-    def analyze_trial(self, data:dict, show_plots=False, debug_mode=False) -> dict:
-        """Segment a signal trail by frequency and return per-chunk statistics"""
-        
-        dom_freqs, change_idxs = self.compute_freq_changes_sfft(data['fg'], show_plots=show_plots)
-
-        chunk_info = self._segment_chunks(data, dom_freqs, change_idxs)
-             
-        means = self._compute_chunk_means(data, chunk_info, debug_mode)
-        
-        means['fg_freq'] = chunk_info['fg_freq']
-
-        means['fg_freq'][means['fg_freq'] == 0] = 50000 # manually set zero to the largest value since it isn't computed correctly by the SFFT
-                
-        return means
-        
+                    
     def analyze_all_trials(self, show_plots=False, debug_mode=False) -> dict:
         """Run 'analyze_trial' over every trial and assemble the rheological results"""
         
@@ -226,8 +211,8 @@ class LockinAnalysis(OTDataset):
     def compute_moduli(self, free_memory=True, debug_mode=False):
         """Compute the shear moduli G' and G" from the active microrheology results."""
         freq_list = self.results["fg_freq"]
-        ynot = self.results["ynot"]
-        fnot = self.results["fnot"]
+        y0 = self.results["y0"]
+        f0 = self.results["f0"]
         delta = self.results["delta"]
         
         if debug_mode:
@@ -235,8 +220,8 @@ class LockinAnalysis(OTDataset):
             x = self.results['x']
             y = self.results['y']            
                 
-        G1 = np.abs(fnot / (6 * np.pi * self.constants.r * ynot)) * np.cos(delta)
-        G2 = np.abs(fnot / (6 * np.pi * self.constants.r * ynot)) * np.sin(delta)
+        G1 = np.abs(f0 / (6 * np.pi * self.constants.r * y0)) * np.cos(delta)
+        G2 = np.abs(f0 / (6 * np.pi * self.constants.r * y0)) * np.sin(delta)
                
         if debug_mode:                         
             plt.figure()
@@ -366,8 +351,8 @@ class LockinAnalysis(OTDataset):
                 
         results = {
             'fg_freq': data['fg_freq'],
-            'fnot': C,
-            'ynot': data['mean_r'],
+            'f0': C,
+            'y0': data['mean_r'],
             'delta': delta_phi,
         }
         
