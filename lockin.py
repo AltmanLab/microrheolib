@@ -36,7 +36,7 @@ class LockinAnalysis(OTDataset):
         """Run 'analyze_trial' over every trial and assemble the rheological results"""
         
         if show_plots:
-            fig, axs = plt.subplots(1, 3, figsize=(14, 4.8))
+            fig, axs = plt.subplots(1, len(self.data_dict), figsize=(14, 4.8))
 
         trial_outputs = []
         for ax, (trial_name, trial_data) in zip(axs, self.data_dict.items()):
@@ -47,14 +47,12 @@ class LockinAnalysis(OTDataset):
             means = self._compute_chunk_means(trial_data, chunk_info, debug_mode)
         
             means['fg_freq'] = chunk_info['fg_freq']
-
-            means['fg_freq'][means['fg_freq'] == 0] = 50000 # manually set zero to the largest value since it isn't computed correctly by the SFFT
             trial_outputs.append(means)
 
             if show_plots:
                 ax.plot(dom_freqs, marker='.', label='Dominant Frequencies')
                 mid_idx = (change_idxs[:-1] + change_idxs[1:] - 1) // 2
-                [ax.text(i, dom_freqs[i]*1.01, f"{dom_freqs[i]:.0f}", ha='center', va='bottom') for i in mid_idx]
+                [ax.text(i, dom_freqs[i]*1.01, f"{dom_freqs[i]:.3g}", ha='center', va='bottom') for i in mid_idx]
                 ax.set_title(f"{trial_name}")
         
         if show_plots:
@@ -73,8 +71,11 @@ class LockinAnalysis(OTDataset):
             else [b for res in trial_outputs for b in res[k]]
             for k in keys
         }
+
+        idx = np.argmax(trials['fg_freq']) # b/c of our sample rate, 50000 shows up at ~0 Hz
+        trials['fg_freq'][idx+1] = 50000
         
-        # Zero X and Y at the highest drive frequency
+        # Zero X and Y at the highest drive frequency (which is ~0 due to sampling limiation)
         # At the highest frequency the bead response is negligible, 
         # so any non-zero mean is an instrumental offset that should be removed
         idx_ref = np.argmax(trials['fg_freq'])
@@ -87,22 +88,32 @@ class LockinAnalysis(OTDataset):
         
         # R magnitude must be recomputed from the zeroed X and Y values
         mean_r = np.sqrt(trials['mean_x'] ** 2 + trials['mean_y'] ** 2)
-        trials['mean_r'] = 1e-9 * self.calib.ed_fit_func(mean_r)
+        trials['mean_r'] = 1e-9 * self.calib.ed_fit_func(mean_r * np.sqrt(2) - self.calib.v_offset)
 
-        if show_plots:
-            plt.figure()
-            plt.plot(trials['fg_freq'], trials['mean_x'], 'b.', label='X')
-            plt.plot(trials['fg_freq'], trials['mean_y'], 'g.', label='Y')
-            plt.plot(trials['fg_freq'], mean_r, 'r.', label=r'$\sqrt{X^2+Y^2}$')
-            plt.axhline(0, color='r', linestyle='--')
-            plt.text(0.9*trials['fg_freq'].max(), np.median(mean_r)*1.05, f'X Offset: {x_ref: .2e}', ha='right', va='bottom', color='k', alpha=0.8)
-            plt.text(0.9*trials['fg_freq'].max(), np.median(mean_r)*0.995, f'Y Offset: {y_ref: .2e}', ha='right', va='top', color='k', alpha=0.8)
-            plt.ylabel('Lockin (V)')
-            plt.xlabel('Freq (Hz)')
-            plt.xscale('log')
-            plt.legend()
-            plt.title('X, Y, R Data')
-            plt.show()
+        # if show_plots:
+        #     plt.figure()
+        #     plt.plot(trials['fg_freq'], trials['mean_x'], 'b.', label='X')
+        #     plt.plot(trials['fg_freq'], trials['mean_y'], 'g.', label='Y')
+        #     plt.plot(trials['fg_freq'], mean_r, 'r.', label=r'$\sqrt{X^2+Y^2}$')
+        #     plt.axhline(0, color='r', linestyle='--')
+        #     plt.text(0.9*trials['fg_freq'].max(), np.median(mean_r)*1.05, f'X Offset: {x_ref: .2e}', ha='right', va='bottom', color='k', alpha=0.8)
+        #     plt.text(0.9*trials['fg_freq'].max(), np.median(mean_r)*0.995, f'Y Offset: {y_ref: .2e}', ha='right', va='top', color='k', alpha=0.8)
+        #     plt.ylabel('Lockin (V)')
+        #     plt.xlabel('Freq (Hz)')
+        #     plt.xscale('log')
+        #     plt.legend()
+        #     plt.title('X, Y, R Data')
+        #     plt.show()
+
+        # freqs = np.r_[
+        #     np.logspace(np.log10(5), np.log10(30), 8),
+        #     np.logspace(np.log10(30), np.log10(100), 7),
+        #     np.logspace(np.log10(100), np.log10(6000), 20),
+        #     50000
+        # ]
+
+        # sort_idx = np.argsort(trials['fg_freq'])
+        # trials['fg_freq'][sort_idx] = np.round(freqs, 6) # match rounding of the FG
         
         self.results = self._compute_force_phase(trials, debug_mode=debug_mode)
                     
@@ -151,7 +162,7 @@ class LockinAnalysis(OTDataset):
         
         window = windows.hann(window_len, sym=False)
         
-        SFT = ShortTimeFFT(window, hop=hop_len, fs=fs, mfft=4*window_len) # TODO mfft parameter?
+        SFT = ShortTimeFFT(window, hop=hop_len, fs=fs, mfft=8*window_len) # TODO mfft parameter?
         fft = SFT.stft(fg)
         mag = np.abs(fft)
 
@@ -171,41 +182,38 @@ class LockinAnalysis(OTDataset):
         #     plt.show()
         
         dominant_bins = np.argmax(mag, axis=0)
-        dom_freqs = SFT.f[dominant_bins] # dominant freq of bin i
+
+        # clips edge bins to avoid out-of-bounds, where argmax is unreliable anyway
+        lo = np.clip(dominant_bins - 1, 0, mag.shape[0] - 1)
+        hi = np.clip(dominant_bins + 1, 0, mag.shape[0] - 1)
+        alpha, beta, gamma = mag[lo, np.arange(mag.shape[1])], mag[dominant_bins, np.arange(mag.shape[1])], mag[hi, np.arange(mag.shape[1])]
+        denom = (alpha - 2*beta + gamma)
+        offset = np.where(np.abs(denom) > 1e-12, 0.5 * (alpha - gamma) / denom, 0.0)
+        dom_freqs = SFT.f[dominant_bins] + offset * SFT.delta_f # dominant freq of bin i
                 
-        freq_tol = 1 # Hz
+        freq_tol = 0.5 # Hz
         
         freq_changes = np.where(np.abs(np.diff(dom_freqs)) > freq_tol)[0] + 1
         boundaries = np.concatenate(([0], freq_changes, [len(dom_freqs)])) # add first and last index        
 
         chunk_sizes = np.diff(boundaries)
-        keep = chunk_sizes > 1 # only keep freq chunks with more then one sample to remove mid transition values
+        keep = chunk_sizes > 2 # only keep freq chunks with more then 2 samples to remove mid transition values
         boundaries = np.concatenate(([boundaries[0]], boundaries[1:][keep]))
 
-        merged_boundaries = [boundaries[0]] # merge neighboring chunks with the same frequency
-        for i in range(1, len(boundaries) - 1):
-            prev_start, prev_end = merged_boundaries[-1], boundaries[i]
-            curr_end = boundaries[i + 1]
+        chunk_freqs = np.array([
+            np.median(dom_freqs[boundaries[i]:boundaries[i+1]])
+            for i in range(len(boundaries)-1)
+        ])
 
-            # frequency of previous chunk
-            prev_chunk_mid = (prev_start + prev_end) // 2
-            prev_freq = dom_freqs[prev_chunk_mid]
+        merged_boundaries = [boundaries[0]]
 
-            # representative frequency of current chunk
-            curr_chunk_mid = (prev_end + curr_end) // 2
-            curr_freq = dom_freqs[curr_chunk_mid]
+        for i in range(1, len(chunk_freqs)):
+            if abs(chunk_freqs[i] - chunk_freqs[i-1]) > 2*freq_tol:
+                merged_boundaries.append(boundaries[i])
 
-            # if same frequency → merge (do NOT append boundary)
-            if np.abs(prev_freq - curr_freq) <= freq_tol:
-                continue
-
-            # otherwise start a new chunk
-            merged_boundaries.append(prev_end)
-
-        # include the final boundary
         merged_boundaries.append(boundaries[-1])
         merged_boundaries = np.array(merged_boundaries)
-                                
+                                        
         return dom_freqs, merged_boundaries
             
     def compute_moduli(self, free_memory=True, debug_mode=False):
@@ -234,7 +242,7 @@ class LockinAnalysis(OTDataset):
             plt.axhline(np.pi, 0 , 1)
             plt.xscale('log')
             plt.legend()
-            plt.title('Deltas')
+            plt.title('Phases')
             plt.show()
 
         if free_memory:
@@ -329,30 +337,30 @@ class LockinAnalysis(OTDataset):
         Xb, Yb = np.mean(bead * cos_ref), np.mean(bead * sin_ref)
         Xf, Yf = np.mean(fg   * cos_ref), np.mean(fg   * sin_ref)
 
-        return np.arctan2(Yb*Xf - Xb*Yf, Xb*Xf + Yb*Yf)
+        return np.arctan2(Yb*Xf - Xb*Yf, Xb*Xf + Yb*Yf), 2 * np.sqrt(Xf**2 + Yf**2), 2 * np.sqrt(Xb**2 + Yb**2)
 
     def _compute_force_phase(self, data, debug_mode=False):
         """Compute force magnitue and phase dependent components"""
-        
-        y_trap = self.calib.a * np.sqrt(2) * data['std_fg'] + self.calib.b # ! a and b are in nm
-        A = self.calib.ky * y_trap * 1e-9
-        
-        B = -self.calib.ky * data['mean_r']
-
-        phi = np.array([
-            self._software_phi(data['bead_y'][i], data['fg'][i], data['fg_freq'][i])
+                
+        phi, trap_amp, bead_amp = np.array([
+            self._software_phi(data['bead_y'][i], (self.calib.a * data['fg'][i] + self.calib.b) * 1e-9, data['fg_freq'][i])
             for i in range(len(data['fg_freq']))
-        ])
-        
+        ]).T
+
+        A = self.calib.ky * trap_amp
+        B = -self.calib.ky * bead_amp
         C = np.sqrt(A**2 + B**2 + 2 * A * B * np.cos(phi))
         phi_new = np.arctan2(B * np.sin(phi), A + B * np.cos(phi))
+
+        flipped = phi_new < -np.pi/2
+        phi_new[flipped] += np.pi/2
 
         delta_phi = phi - phi_new
                 
         results = {
             'fg_freq': data['fg_freq'],
             'f0': C,
-            'y0': data['mean_r'],
+            'y0': bead_amp,
             'delta': delta_phi,
         }
         

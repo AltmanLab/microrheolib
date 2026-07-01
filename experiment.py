@@ -26,7 +26,7 @@ class ExperimentalConstants:
         self.beta = 6 * np.pi * self.eta * self.r
 
     @classmethod
-    def from_preset(cls, preset='iodixinol20', bead_dia=2.0e-6):
+    def from_preset(cls, preset='iodixinol20', bead_dia=1.97e-6):
         if preset not in PRESET_ETA:
             raise ValueError(f"Unknown preset '{preset}'. Choose from {list(PRESET_ETA)}")
         return cls(eta=PRESET_ETA[preset], r=bead_dia / 2)
@@ -196,11 +196,13 @@ class Experiment:
         x_knots = spline.get_knots()
         return f, x_knots, f(x_knots)
 
-    def calibrate(self, lin_range:tuple[float, float]=(-200, 200), spline_fit:tuple[int, tuple[float, float]]=(2, (-40, 400)), show_plots=()):
+    def calibrate(self, folder_name=None, lin_range:tuple[float, float]=(-200, 200), spline_fit:tuple[int, tuple[float, float]]=(2, (-40, 400)), center_width=0.65, show_plots=()):
         """Function generator calibration and entire detector fitting. Sets the linear fit parameters self.a and self.b for converting the function generator signal into distance. Also computes the entire detector fit function (usage shown below).
         
         Parameters
         ----------
+        folder_name : str
+            Optional name of the FunctionG data. If 'None' defaults to 'FunctionG'.
         lin_range : tuple(min_nm, max_nm)
             Range of values to fit the linear trap calibration region, in nanometers
         spline_fit : tuple(knots, (lower_bound_nm, upper_bound_nm))
@@ -225,13 +227,21 @@ class Experiment:
         """
         # Load the data
         fh = self.fh
-        ls_dir = os.listdir(fh)
-        if 'functiong' in ls_dir:
-            fh += '/functiong/'
-        elif 'FunctionG' in ls_dir:
-            fh += '/FunctionG/'
-        else:
-            raise ValueError('No function generator data found in the folder')
+        if folder_name is None:
+            folder_name = 'functiong'
+
+        folder = next(
+            (name for name in os.listdir(fh)
+             if os.path.isdir(os.path.join(fh, name))
+             and name.lower() == folder_name),
+             None,
+        )
+
+        if folder is None:
+            raise ValueError('No FunctionG data found in the folder')
+        
+        fh = os.path.join(fh, folder) + '/'
+
         x, y, sumsignal, fg = load_data(fh, self.config.fg_starttime, self.config.fg_endtime)
 
         plots = set(show_plots) # position, signal_jumps
@@ -259,7 +269,7 @@ class Experiment:
         
         # find plateau boundaries (i.e. where the bead has leveled off after a FG jump)
         abs_diff = np.abs(np.diff(fg))
-        threshold = np.mean(abs_diff) + 3*np.std(abs_diff)
+        threshold = np.mean(abs_diff) + 5*np.std(abs_diff)
 
         jumpy_idxs = np.where(abs_diff > threshold)[0]
         jumpy_idxs = jumpy_idxs[np.insert(np.diff(jumpy_idxs) > 1, 0, True)] # remove consecutive indicies
@@ -288,7 +298,7 @@ class Experiment:
             axs[2].set_title('Absolute Differences')
             plt.show()
 
-                # compute average fg and bead position from each stable region
+        # compute average fg and bead position from each stable region
         avg_fg = []
         avg_y = []
         std_fg = []
@@ -306,10 +316,16 @@ class Experiment:
         std_fg = np.array(std_fg)
 
         # ensure the fg was stable in each region (i.e. not in the middle of a jump)
-        stable_mask = std_fg < (1.1 * np.mean(std_fg))
+        stable_mask = std_fg < (3 * np.mean(std_fg))
 
         avg_fg = avg_fg[stable_mask]
         avg_y = avg_y[stable_mask]
+
+        # remove any points that are within 20nm of the center of the trap; these must be caused by noise
+        mask = np.abs(avg_y - self.calib.trapy) > 20e-9
+
+        avg_y = avg_y[mask]
+        avg_fg = avg_fg[mask]
 
         # linear trap calibration (convert from volts to meters)
         upper, lower = 1e-9*lin_range[1] + self.calib.trapy, 1e-9*lin_range[0] + self.calib.trapy
@@ -329,7 +345,7 @@ class Experiment:
             self.calib.v_offset = np.mean(detector_v)
 
             detector_v -= self.calib.v_offset
-            
+      
             mask = (bead_pos_nm > fit_min) & (bead_pos_nm < fit_max)
 
             sort_idx = np.argsort(detector_v[mask])
@@ -353,10 +369,11 @@ class Experiment:
             X, uniq_idx = np.unique(X, return_index=True)
             Y = Y[uniq_idx]
 
+
             idxs = np.argsort(X)[5:-5] # remove first and last 5 points to clean up noise from edges
             X = X[idxs]
             Y = Y[idxs]
-            self.calib.ed_fit_func, x_knots, y_knots = self.fit_ed_spline(X, Y, 1e9 * self.calib.trapy, k=spline_fit[0])
+            self.calib.ed_fit_func, x_knots, y_knots = self.fit_ed_spline(X, Y, 1e9 * self.calib.trapy, k=spline_fit[0], center_width=center_width)
         
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.8))
             ax1.plot(avg_fg, 1e9 * avg_y, 'k.', label='Calibration Points')
@@ -386,8 +403,13 @@ class Experiment:
             plt.tight_layout()
             plt.show()
 
-    def _brownian_analysis(self, show_plots=False):
+    def _brownian_analysis(self, folder_name=None, show_plots=False):
         """Brownian analysis for an experiment
+
+        Parameters
+        ----------
+        folder_name : str
+            Optional folder name of Brownian data. If 'None' defaults to 'Brownian'.
 
         Returns
         -------
@@ -400,13 +422,20 @@ class Experiment:
         """
 
         fh = self.fh
-        ls_dir = os.listdir(fh)
-        if 'brownian' in ls_dir: # TODO is there a better (more generic) solution to this?
-            fh += '/brownian/'
-        elif 'Brownian' in ls_dir:
-            fh += '/Brownian/'
-        else:
+        if folder_name is None:
+            folder_name = 'brownian'
+
+        folder = next(
+            (name for name in os.listdir(fh)
+             if os.path.isdir(os.path.join(fh, name))
+             and name.lower() == folder_name),
+             None,
+        )
+
+        if folder is None:
             raise ValueError('No brownian data found in the folder')
+        
+        fh = os.path.join(fh, folder) + '/'
 
         xb, yb, sumsignalb, fg, freqs, powerspecx, powerspecy = load_data(fh, self.config.starttime, self.config.endtime,
                                                                                 return_power_spectrum=True, chunk_dur=self.config.chunk_dur)
@@ -487,7 +516,17 @@ class Experiment:
         return Sx, Sy, alphax, alphay, np.mean(xb)/Sx, np.mean(yb)/Sy
     
     def plot_moduli(self, datasets: list[str] | None=None, title=None, axes=None) -> tuple[plt.Figure, plt.Axes, plt.Axes]:
-        """Plot G' and G'' for all datasets in the experiment."""
+        """Plot G' and G'' for all datasets in the experiment.
+        
+        Parameters
+        ----------
+        datasets : list[str] | None
+            A list of datasets to include or exclude by name. To exclude datasets use the '-' prefix. Only include or exclude at one time, mixing will throw an error. Default is to plot everything.
+        title : str | None
+            A custom title for the plot.
+        axes: plt.axes | None
+            Custom axes to plot the datasets on.
+        """
         if axes is not None:
             ax1, ax2 = axes
             fig = ax1.get_figure()
@@ -496,27 +535,41 @@ class Experiment:
 
         if datasets is None:
             selected = self.datasets
+        elif np.any([name.startswith('-') for name in datasets]):
+            excluded = {name[1:] for name in datasets if name.startswith('-')}
+            selected = {
+                k: v for k, v in self.datasets.items() if k not in excluded
+            }
         else:
-            unknown = set(datasets) - self.datasets.keys()
-            if unknown:
-                raise ValueError(f'Unknown datasets: {unknown}. '
-                                 f'Available: {list(self.datasets.keys())}')
-            selected = {k: self.datasets[k] for k in datasets}
+            selected = {
+                k: self.datasets[k] for k in datasets
+                if k in self.datasets
+            }
 
         from microrheo.passive import PassiveAnalysis
 
-        colors = ['#00487C', '#E84855', '#3BB273', '#F4A261', '#6A4C93']
+        colors = [
+            "#0072B2",
+            "#009E73",
+            "#56B4E9",
+            "#E69F00",
+            "#CC79A7",
+            "#D55E00",
+            "#000000",
+        ]
+        
         for (name, ds), color in zip(selected.items(), cycle(colors)):
             style_passive = dict(marker='None', linestyle='-',  color=color, alpha=0.8)
             style_active  = dict(marker='.',    linestyle='None', color=color, alpha=0.8)
 
             style = style_passive if isinstance(ds, PassiveAnalysis) else style_active
+            sort_idx = np.argsort(ds.omega_list)[:-1] # drop the 50000 Hz point
 
-            ax1.loglog(ds.omega_list, ds.G1, **style, label=f"{name} G'")
-            ax2.loglog(ds.omega_list, ds.G2, **style, label=f'{name} G"')
+            ax1.loglog(ds.omega_list[sort_idx], ds.G1[sort_idx], **style, label=f"{name} G'")
+            ax2.loglog(ds.omega_list[sort_idx], ds.G2[sort_idx], **style, label=f'{name} G"')
 
         for ax in (ax1, ax2):
-            ax.set_xlabel(r'Angular Frequency $\omega$ [rad/s]')
+            ax.set_xlabel(r'Angular Frequency $\omega$ [rad/s]', fontsize=12)
             ax.grid(True, which='both', linestyle='--', linewidth=0.6, alpha=0.5)
             ax.legend()
 

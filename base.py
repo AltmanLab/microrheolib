@@ -1,12 +1,8 @@
 from microrheo.utils import *
 
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from microrheo.experiment import TrapCalibration, ExperimentalConstants
-
 class OTDataset:
     """Parent class for passive and active datasets"""
-    def __init__(self, fh, constants:ExperimentalConstants, calib:TrapCalibration):   # doesn't matter what you set calib_starttime and calib_endtime to if you have the calibration already
+    def __init__(self, fh, constants, calib):   # doesn't matter what you set calib_starttime and calib_endtime to if you have the calibration already
         """
         Parameters
         ----------

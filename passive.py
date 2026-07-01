@@ -76,7 +76,7 @@ class PassiveAnalysis(OTDataset):
         self.tau, self.msd = tau, msd
         return self.tau, self.msd
     
-    def compute_alpha(self, n_points=500, sigma=25, show_plots=True):
+    def compute_alpha(self, n_points=500, sigma_msd=15, sigma_alpha=75, show_plots=True):
         """Compute log-log MSD slope (alpha) using log-spacing binning and spline fitting
         
         Parameters
@@ -87,7 +87,7 @@ class PassiveAnalysis(OTDataset):
             Smoothing parameter passed to the gaussian filter. Nominally around 5% of `n_points`
         """
                 
-        logtau, logmsd = np.log10(self.tau), np.log10(self.msd)
+        logtau, logmsd = np.log10(self.tau[1:]), np.log10(self.msd[1:]) # skip first data point
         
         # remove any nans/infs
         mask = np.isfinite(logtau) & np.isfinite(logmsd)
@@ -108,27 +108,34 @@ class PassiveAnalysis(OTDataset):
         # remove any nans/infs
         mask = np.isfinite(logtau_rs) & np.isfinite(logmsd_rs)
         logtau_rs, logmsd_rs = logtau_rs[mask], logmsd_rs[mask]
-
         delta = logtau_rs[1] - logtau_rs[0]
-        n_pad = 4 * sigma # add enough padding to cover the filter's edges
-        n_local = max(10, len(logtau_rs) // 10) # use the first 10% of the data to capture the local slope at the edge
 
-        left_slope = np.polyfit(logtau_rs[:n_local], logmsd_rs[:n_local], 1)[0]
+        n_pad = 4 * max(sigma_msd, sigma_alpha)
+        n_local = max(10, len(logtau_rs) // 10)
+        left_slope  = np.polyfit(logtau_rs[:n_local],  logmsd_rs[:n_local],  1)[0]
         right_slope = np.polyfit(logtau_rs[-n_local:], logmsd_rs[-n_local:], 1)[0]
+        pad_l = logmsd_rs[0]  + left_slope  * (np.arange(-n_pad, 0) * delta)
+        pad_r = logmsd_rs[-1] + right_slope * (np.arange(1, n_pad + 1) * delta)
+        logmsd_padded = np.concatenate([pad_l, logmsd_rs, pad_r])
 
-        pad_steps_l = np.arange(-n_pad, 0) * delta
-        pad_logmsd_l = logmsd_rs[0] + left_slope * pad_steps_l
+        # --- pass 1: moderate smooth on MSD to preserve transition shape ---
+        logmsd_smooth = gaussian_filter1d(logmsd_padded, sigma_msd)[n_pad:-n_pad]
 
-        pad_steps_r = np.arange(1, n_pad + 1) * delta
-        pad_logmsd_r = logmsd_rs[-1] + right_slope * pad_steps_r
+        # --- differentiate ---
+        alpha_raw = np.gradient(logmsd_smooth, delta)
 
-        logmsd_padded = np.concatenate([pad_logmsd_l, logmsd_rs, pad_logmsd_r])
-        logmsd_smooth = gaussian_filter1d(logmsd_padded, sigma)
-        logmsd_smooth = logmsd_smooth[n_pad:-n_pad]
+        # --- pass 2: larger smooth directly on alpha to kill flat-region noise ---
+        # This works because in the flat region alpha ≈ 0, so a wide kernel just
+        # averages near-zero values together — it can't distort the transition peak
+        # because by the time we reach the flat region, alpha has already decayed.
+        alpha_padded = np.concatenate([
+            np.full(n_pad, alpha_raw[0]),
+            alpha_raw,
+            np.full(n_pad, alpha_raw[-1])
+        ])
+        # alpha_list = gaussian_filter1d(alpha_padded, sigma_alpha)[n_pad:-n_pad]
+        alpha_list = alpha_raw
 
-        alpha_list = np.gradient(logmsd_smooth, delta)
-
-        alpha_list = gaussian_filter1d(alpha_list, sigma)
 
         omega_list = 1 / (10**logtau_rs)
         msd_list = 10**(logmsd_smooth)
@@ -145,9 +152,9 @@ class PassiveAnalysis(OTDataset):
             for start, end in zip(start_idxs, end_idxs):
                 ax1.axvspan(logtau_rs[start], logtau_rs[end], color='r', alpha=0.25, label='Negative Derivative' if start == start_idxs[0] else '')
 
-            ax1.plot(logtau, logmsd, 'k.', ms=1, alpha=0.5, label='Raw')
             ax1.plot(logtau_rs, logmsd_rs, 'mo', ms=3, label=f'Resampled Data (n={n_points})')
-            ax1.plot(logtau_rs, logmsd_smooth, 'r-', label='Gaussian Smoothed')
+            ax1.plot(logtau_rs, logmsd_smooth, 'b-', label='Gaussian Smoothed')
+            ax1.plot(logtau, logmsd, 'k*', ms=5, alpha=0.5, label='Raw')
 
             ax1.legend()
             ax1.set_title('LogLog MSD')
@@ -156,9 +163,11 @@ class PassiveAnalysis(OTDataset):
             
             for start, end in zip(start_idxs, end_idxs):
                 ax2.axvspan(logtau_rs[start], logtau_rs[end], color='r', alpha=0.25, label='Negative Derivative' if start == start_idxs[0] else '')
-            ax2.plot(logtau_rs, alpha_list, 'r-', label='Spline')
             ax2.axhline(0, color='k', lw=0.8, ls='--')
             ax2.axhline(1, color='b', lw=0.8, ls='--')
+            plt.plot(logtau_rs, alpha_raw, 'b-', label='Raw')
+            ax2.plot(logtau_rs, alpha_list, 'r-', label='Smoothed')
+            ax2.legend()
             plt.text(0.9 * logtau_rs.max(), 1, 'diffusive', color='b', ha='right', va='bottom')
             ax2.set_title(r'LogLog MSD Derivative ($\alpha$)')
             ax2.set_xlabel('log(tau)')
