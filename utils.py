@@ -1,59 +1,72 @@
 from matplotlib import pyplot as plt
 import numpy as np
 from scipy import signal
-import scipy.fft
+from scipy.fft import rfft, irfft, next_fast_len, rfftfreq
 import os
+from dataclasses import dataclass, field
+import json
 
 plt.style.use('default')
 
 # ---------- CONSTANTS ---------- # ? maybe move these into the ExperimentalConstants dataclass?
 
-fs = 50000                  # data collection rate
+fs = 100000                  # data collection rate
 dt = 1/fs         
 kBT = 4.11e-21              # room temp (J)
 
 # ---------- UTILITY FUNCTIONS ----------        
-def openfile(filename):   # open files
-        fid = open(filename, 'rb')
-        dim = np.fromfile(fid, dtype='>d') # big-endian (google it lol) decimal
-        fid.close()
-        return dim
+def openfile(filename):   
+    """Open files."""
+    fid = open(filename, 'rb')
+    dim = np.fromfile(fid, dtype='>d') # big-endian (google it lol) decimal
+    fid.close()
+    return dim
 
-def calcpowerspec2(data):    # Calculate power spectrum
+def calcpowerspec2(data):
+    """Calculate power spectrum."""
     f, Pxx_den = signal.welch(data, fs,  nperseg=int(len(data)), window='hamming')
     return f, Pxx_den
 
-def autocorrFFT(x):     # used by the program that calculates the meansquared displacement
-    N=len(x)
-    F = np.fft.fft(x, n=2*N)  #2*N because of zero-padding
+def autocorrFFT(r):
+    """Used by the program that calculates the meansquared displacement."""
+    N = r.shape[0]
+    fsize = next_fast_len(2 * N) # optimze the FFT length with zero padding
+    F = rfft(r, n=fsize, axis=0)
     PSD = F * F.conjugate()
-    res = np.fft.ifft(PSD)
-    res= (res[:N]).real   #now we have the autocorrelation in convention B
-    n=N*np.ones(N)-np.arange(0,N) #divide res(m) by (N-m)
-    return res/n #this is the autocorrelation in convention A
+    res = irfft(PSD, n=fsize, axis=0)[:N].real # autocorrelation in convention B
+    n = (N - np.arange(N))[:, None] # divide by (N-m), broadcast over columns
+    return res / n # autocorrelation in convention A
 
-def msd_fft(x, y):      # calculate the mean squared displacement
+def msd_fft(x, y):
+    """Calculate the mean squared displacement."""
     # Organize the data into a 2-column array where each row contains an x and y position
-    r = np.ones((int(len(x)), 2))
-    for i in range(0,int(len(x))):
-        values = [x[i], y[i]]
-        r[i] =  values
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    r = np.column_stack((x, y))
+    N = r.shape[0]
 
     # calculate the MSD using the FFT
-    N=len(r)
-    D=np.square(r).sum(axis=1)
-    D=np.append(D,0)
-    S2=sum([autocorrFFT(r[:, i]) for i in range(r.shape[1])])
-    Q=2*D.sum()
-    S1=np.zeros(N)
-    for m in range(N):
-        Q=Q-D[m-1]-D[N-m]
-        S1[m]=Q/(N-m)
-    msdval = S1-2*S2
-    tau = np.multiply(dt, [i for i in range(1, len(msdval)+1)])
+    D = np.square(r).sum(axis=1)
+    S2 = autocorrFFT(r).sum(axis=1) # sum x_autocorr + y_autocorr
+
+    Dsum = D.sum()
+    cumD = np.cumsum(D)
+    m = np.arange(N)
+
+    C1 = np.zeros(N)
+    C1[1:] = cumD[:-1]
+
+    C2 = Dsum - cumD[N - m - 1]
+    
+    Q = 2 * Dsum - C1 - C2
+    S1 = Q / (N - m)
+
+    msdval = S1 - 2 * S2
+    tau = dt * np.arange(1, N + 1)
     return tau, msdval
 
 def calcmsd2(x, y, analysislength, msdlength, silent=False):
+    """Calculate the two dimensional mean squared displacement."""
     # Select data to analyze MSD and fourier transform
     xdata = x[0:int(analysislength/dt)]
     ydata = y[0:int(analysislength/dt)]
@@ -78,8 +91,8 @@ def calcmsd2(x, y, analysislength, msdlength, silent=False):
         msddata = np.array(msd[1:int(msdlength/dt)]) / (1e18)
         N = len(msddata)
         T = 1/fs
-        yf = scipy.fft.fft(msddata)
-        xf = scipy.fft.fftfreq(N, T)[:N//2]
+        yf = rfft(msddata)
+        xf = rfftfreq(N, T)[:N//2]
 
         print(len(xf))
         print(len(yf))
@@ -90,126 +103,107 @@ def calcmsd2(x, y, analysislength, msdlength, silent=False):
         
     return tau, msd
 
+def software_demod(bead, fg, f):
+    """Compute bead and FG phase/amplitude via software demodulation.
+    
+    Parameters
+    ----------
+    bead : np.ndarray
+        Bead position data (meters)
+    fg : np.ndarray
+        Function generator position data (meters)
+    f : np.ndarray
+        Function generator frequency (Hz)
+
+    Returns
+    -------
+    phi : float
+        Phase difference between the bead and FG in radians
+    trap_amp : float
+        Amplitude of the trap in meters
+    bead_amp : float
+        Amplitude of the bead in meters
+    """
+    t = np.arange(len(bead)) * dt
+    bead = bead - np.mean(bead)
+    fg = fg - np.mean(fg)
+
+    cos_ref = np.cos(2 * np.pi * f * t)
+    sin_ref = np.sin(2 * np.pi * f * t)
+
+    Xb, Yb = np.mean(bead * cos_ref), np.mean(bead * sin_ref)
+    Xf, Yf = np.mean(fg   * cos_ref), np.mean(fg   * sin_ref)
+
+    return np.arctan2(Yb*Xf - Xb*Yf, Xb*Xf + Yb*Yf), 2 * np.sqrt(Xf**2 + Yf**2), 2 * np.sqrt(Xb**2 + Yb**2)
+
 def load_data(fh:str, starttime, endtime, return_power_spectrum:bool=False, chunk_dur=1.0) -> tuple[np.array, np.array, np.array, np.array]:
-    """Load the data from file, concatenate it and return it as a tuple of arrays
-    Optionally return the power spectrum of the data as well
+    """Load the data from file, concatenate it and return it as a tuple of arrays. Optionally return the power spectrum of the data as well.
 
     Parameters
     ----------
     fh: str
         File handle
+    starttime : float
+        Start time of data (in seconds)
+    endtime : float
+        End time of data (in seconds)
     return_power_spectrum: bool = False 
-        whether to return the power spectrum of the data or not
+        If True, return the power spectrum of the data
     chunk_dur: float = 1.0
-        duration of chunk size in seconds for power spectrum
+        Duration of chunk size (in seconds) for the power spectrum
 
     Returns
     -------
-    longdatax: np.array
-        x position data
-    longdatay: np.array
-        y position data
-    longdatasum: np.array
-        sum signal
-    longdatafg: np.array
-        function generator data
-    powerspecx: np.array
-        power spectrum of x position data
-    powerspecy: np.array
-        power spectrum of y position data
+    ch1: np.ndarray
+        First data stream channel
+    cb2: np.ndarray
+        Second data stream channel
+    f : np.ndarray
+        Frequencies for the power spectrum
+    powerspecx: np.ndarray
+        Power spectrum of x position data
+    powerspecy: np.ndarray
+        Power spectrum of y position data
     """
     
     file_sort = lambda s: int(s.split('_')[-1]) # slow?
 
-    longdatax = []
-    longdatay = []
-    longdatasum = []
-    longdatafg = []
+    channel1 = []
+    channel2 = []
 
     fhs = sorted(os.listdir(fh), key=file_sort)
     fhs = fhs[:-1] # remove the last file, as this causes errors
-    count = 0
-    for i, sh in enumerate(fhs):    # this is problematic, because it takes every data file; let's include a selection based on the time
-        dim = openfile(fh+sh)
-        datax = dim[0::4]
-        datay = dim[2::4]
-        datafg = dim[3::4]
-        datasum = dim[1::4]
-        for i in range(len(datax)):
-            longdatax.append(datax[i])
-            longdatay.append(datay[i])
-            longdatasum.append(datasum[i])
-            longdatafg.append(datafg[i])
 
-    longt = np.arange(len(longdatax))*dt
-    indexcut = (longt > starttime) * (longt < endtime)
-    longdatax = np.array(longdatax)[indexcut]
-    longdatay = np.array(longdatay)[indexcut]
-    longdatasum = np.array(longdatasum)[indexcut]
-    longdatafg = np.array(longdatafg)[indexcut]
+    count = 0
+    for i, sh in enumerate(fhs): # this is problematic, because it takes every data file; let's include a selection based on the time
+        dim = openfile(fh+sh)
+        ch1 = dim[0::2]
+        ch2 = dim[1::2]
+        for i in range(len(ch1)):
+            channel1.append(ch1[i])
+            channel2.append(ch2[i])
+
+    t = np.arange(len(channel1))*dt
+    idxs = (t > starttime) & (t < endtime)
+    channel1 = np.asarray(channel1)[idxs]
+    channel2 = np.asarray(channel2)[idxs]
 
     if return_power_spectrum:
-        powerspecx = np.zeros(int(chunk_dur*fs//2+1))
-        powerspecy = np.zeros(int(chunk_dur*fs//2+1))
+        powerspecx = np.zeros(int(chunk_dur * fs//2 + 1))
+        powerspecy = np.zeros(int(chunk_dur * fs//2 + 1))
         
-        for k in range(0, (len(longdatax)), int(chunk_dur*fs)):
-            if len(longdatax[k:int(k+chunk_dur*fs)]) == chunk_dur*fs:
-                dataxchunk = longdatax[k:int(k+chunk_dur*fs)]
-                dataychunk = longdatay[k:int(k+chunk_dur*fs)]
-                fx, Pxx_den = calcpowerspec2(dataxchunk)
+        for k in range(0, (len(channel1)), int(chunk_dur * fs)):
+            if len(channel1[k:int(k + chunk_dur * fs)]) == chunk_dur * fs:
+                dataxchunk = channel1[k:int(k + chunk_dur * fs)]
+                dataychunk = channel2[k:int(k + chunk_dur * fs)]
+                f, Pxx_den = calcpowerspec2(dataxchunk)
                 powerspecx += Pxx_den
-                fy, Pyy_den = calcpowerspec2(dataychunk)
+                _, Pyy_den = calcpowerspec2(dataychunk)
                 powerspecy += Pyy_den
                 count += 1
         powerspecx = powerspecx/count
         powerspecy = powerspecy/count
 
-        return np.array(longdatax), np.array(longdatay), np.array(longdatasum), np.array(longdatafg), fx, powerspecx, powerspecy
+        return channel1, channel2, f, powerspecx, powerspecy
 
-    return np.array(longdatax), np.array(longdatay), np.array(longdatasum), np.array(longdatafg)
-
-def load_lockin_data(fh:str, folders=None) -> dict:
-    """Load the data recorded from the lock-in and return it as a dictionary structured as,
-    {
-        [folder1_name]: {
-            'x':  [x_data...],
-            'y':  [y_data...],
-            'r':  [r_data...],
-            'fg': [fg_data...],
-        },
-        
-        [folder2_name]:
-        ...
-    }
-    """
-    
-    data_dict = {}
-    
-    file_sort = lambda s: int(s.split('_')[-1])
-    
-    if folders is None:
-        folders = [f for f in os.listdir(fh) if os.path.isdir(os.path.join(fh, f))]
-        
-    for folder in folders:
-        folder_path = os.path.join(fh, folder)
-        x, y, bead_y, fg = [], [], [], []
-        
-        files = sorted(os.listdir(folder_path), key=file_sort)[:-1]
-        
-        if not files: continue # skip empty folders
-
-        for file in files:
-            dim = openfile(os.path.join(folder_path, file))
-            x.extend(dim[1::4])
-            y.extend(dim[2::4])
-            bead_y.extend(dim[3::4])
-            fg.extend(dim[0::4])
-
-        data_dict[folder] = {
-            'x':  np.array(x),
-            'y':  np.array(y),
-            'bead_y':  np.array(bead_y),
-            'fg': np.array(fg)
-            }
-
-    return data_dict
+    return channel1, channel2

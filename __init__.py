@@ -5,4 +5,4 @@ from .utils import *
 from .experiment import *
 from .base import OTDataset
 from .passive import PassiveAnalysis
-from .lockin import LockinAnalysis
+from .active import ActiveAnalysis
