@@ -15,7 +15,7 @@ class ActiveAnalysis(OTDataset):
         active.plot_g1g2()
     """
 
-    def __init__(self, fh, constants, calib, starttime=0, endtime=180, sample_type='water'):
+    def __init__(self, fh, constants, calib, starttime=0, endtime=185, sample_type='water'):
         """
         Parameters
         ----------
@@ -193,7 +193,10 @@ class ActiveAnalysis(OTDataset):
         mid_idx = (change_idxs[:-1] + change_idxs[1:] - 1) // 2
         detected_freqs = dom_freqs[mid_idx]
 
-        commanded_freqs = np.logspace(np.log10(1), np.log10(1e4), 35)
+        commanded_freqs = np.concat(
+                            [np.geomspace(1, 5, 10)[:-1],
+                            np.geomspace(5, 1e4, 41)]
+                        )
 
         nearest_idx = np.abs(detected_freqs[:, None] - commanded_freqs[None, :]).argmin(axis=1)
         self.fg_freqs = commanded_freqs[nearest_idx]

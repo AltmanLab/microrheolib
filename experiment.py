@@ -5,6 +5,7 @@ from itertools import cycle
 from scipy.optimize import curve_fit
 from scipy.interpolate import LSQUnivariateSpline
 from datetime import datetime
+import glob
 
 # viscosity presets (Pa s)
 PRESET_ETA = {
@@ -199,7 +200,7 @@ class Experiment:
         x_knots = spline.get_knots()
         return f, x_knots, f(x_knots)
 
-    def calibrate(self, folder_name=None, lin_range:tuple[float, float]=(-200, 200), spline_fit:tuple[int, tuple[float, float]]=(2, (-40, 400)), center_width=0.65, show_plots=()):
+    def calibrate(self, folder_name=None, lin_range:tuple[float, float]=(-100, 100), spline_fit:tuple[int, tuple[float, float]]=(2, (-500, 500)), center_width=0.65, show_plots=()):
         """Function generator calibration and entire detector fitting. Sets the linear fit parameters self.a and self.b for converting the function generator signal into distance. Also computes the entire detector fit function (usage shown below).
         
         Parameters
@@ -354,10 +355,10 @@ class Experiment:
             dx = np.diff(X)
             if np.any(dx < 0):
                 plt.figure()
-                plt.plot(detector_v, 1e9*bead_pos, 'k.')
-                plt.plot(detector_v[mask], 1e9*bead_pos[mask], 'go', alpha=0.25)
+                plt.plot(detector_v, 1e9*bead_pos - 1e9*self.calib.trapy, 'k.')
+                plt.plot(detector_v[mask], 1e9*bead_pos[mask] - 1e9*self.calib.trapy, 'go', alpha=0.25)
                 violating_idxs = np.where(dx < 0)[0]
-                plt.plot(X[violating_idxs], Y[violating_idxs], 'ro', alpha=0.75)
+                plt.plot(X[violating_idxs], Y[violating_idxs] - 1e9*self.calib.trapy, 'ro', alpha=0.75)
                 plt.xlabel('Detector Voltage (V)')
                 plt.ylabel('Bead Position (nm)')
                 plt.title(f'Polynomial Fit')
@@ -374,25 +375,25 @@ class Experiment:
             self.calib.ed_fit_func, x_knots, y_knots = self.fit_ed_spline(X, Y, self.calib.trapy, k=spline_fit[0], center_width=center_width)
         
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.8))
-            ax1.plot(avg_fg, 1e9 * avg_y, 'k.', label='Calibration Points')
-            ax1.plot(avg_fg[linear_region], 1e9 * avg_y[linear_region], 'go', alpha=0.25, label='Linear Region')
+            ax1.plot(avg_fg, 1e9 * avg_y - 1e9*self.calib.trapy, 'k.', label='Calibration Points')
+            ax1.plot(avg_fg[linear_region], 1e9 * avg_y[linear_region] - 1e9*self.calib.trapy, 'go', alpha=0.25, label='Linear Region')
 
             fg_fit = np.linspace(min(avg_fg), max(avg_fg), 100)
-            ax1.plot(fg_fit, 1e9 * (self.calib.a * fg_fit + self.calib.b), 'r-', label='Linear Fit')
-            ax1.plot(0, 1e9 * self.calib.trapy, 'pb', label='Trap Center')
+            ax1.plot(fg_fit, 1e9 * (self.calib.a * fg_fit + self.calib.b) - 1e9*self.calib.trapy, 'r-', label='Linear Fit')
+            ax1.plot(0, 0, 'pb', label='Trap Center')
             ax1.set_xlabel('FG Voltage (V)')
             ax1.set_ylabel('Bead Position (nm)')
             ax1.legend()
             ax1.set_title('Linear Fit Calibration')
 
-            ax2.plot(detector_v + self.calib.v_offset, 1e9 * bead_pos, 'k.')
-            ax2.plot(detector_v[mask] + self.calib.v_offset, 1e9 * bead_pos[mask], 'go', alpha=0.25)
-            ax2.plot(self.calib.trapy * self.calib.Sy, 1e9 * self.calib.trapy, 'pb', label='Trap Center')
+            ax2.plot(detector_v + self.calib.v_offset, 1e9 * bead_pos - 1e9*self.calib.trapy, 'k.')
+            ax2.plot(detector_v[mask] + self.calib.v_offset, 1e9 * bead_pos[mask] - 1e9*self.calib.trapy, 'go', alpha=0.25)
+            ax2.plot(self.calib.trapy * self.calib.Sy, 0, 'pb', label='Trap Center')
 
             xfit = np.linspace(X.min(), X.max(), 1000) + self.calib.v_offset
-            ax2.plot(xfit, 1e9 * self.calib.ed_fit_func(xfit - self.calib.v_offset), 'r-', lw=2)
-            ax2.plot(x_knots + self.calib.v_offset, 1e9 * y_knots, 'r.')
-            ax2.plot(xfit, xfit * 1e9 / self.calib.Sy, color='gray', linestyle='--', label='Linear Fit')
+            ax2.plot(xfit, 1e9 * self.calib.ed_fit_func(xfit - self.calib.v_offset) - 1e9*self.calib.trapy, 'r-', lw=2)
+            ax2.plot(x_knots + self.calib.v_offset, 1e9 * y_knots - 1e9*self.calib.trapy, 'r.')
+            ax2.plot(xfit, xfit * 1e9 / self.calib.Sy - 1e9*self.calib.trapy, color='gray', linestyle='--', label='Linear Fit')
 
             ax2.set_xlabel('Detector Voltage (V)')
             ax2.set_ylabel('Bead Position (nm)')
@@ -796,38 +797,48 @@ class Experiment:
 
         return payload
     
-    def load(self, filepath: str, datasets: list[str] | None=None, sample_types: list[str] | None=None, prefix: str | None=None) -> list[str]:
+    def load(self, filepath: str, recursive: bool=False, datasets: list[str] | None=None, sample_types: list[str] | None=None) -> list[str]:
         """Load data from disk written by serialize() into this Experiment's dataset registry.
         
         Parameters
         ----------
         filepath : str
-            Path to a JSON file written by serialize().
+            A literal path, or a glob pattern containing '*', '?', or '[' to a JSON file written by serialize().
+        recursive : bool
+            If True, '**' in a glob pattern matches any number of subdirectories. Ignored for literal (non-pattern) paths.
         datasets : list[str] | None
             Include/exclude by name from file.
         sample_types : list[str] | None
             Include/exclude by sample type from file.
-        prefix : str | None
-            Preappend as '{prefix}_{name}' to avoid collisions when merging multiple files with overlapping names. Defaults to experiment name.
 
         Returns
         -------
         list[str]
-            Names added to self.datasets
+            Names added to self.datasets, across all matched file(s).
         """
-        if not filepath.lower().endswith('.json'):
-            filepath += '.json'
+        if any(c in filepath for c in '*?['):
+            pattern = filepath if filepath.lower().endswith('.json') else filepath + '.json'
+            matches = sorted(glob.glob(pattern, recursive=recursive))
+            if not matches:
+                raise FileNotFoundError(f"No files matched pattern '{pattern}'.")
+        else:
+            matches = [filepath if filepath.lower().endswith('.json') else filepath + '.json']
 
+        added = []
+        for fp in matches:
+            added += self._load_single(fp, datasets=datasets, sample_types=sample_types)
+
+    def _load_single(self, filepath:str, datasets: list[str] | None=None, sample_types: list[str] | None=None) -> list[str]:
+        """Load one already-resolved JSON file into self.datasets."""
         with open(filepath) as f:
             payload = json.load(f)
 
-        entries = payload['datasets']
-        entries = self._filter_by(entries, datasets, key_fn=lambda k, v: k)
+        entries = self._filter_by(payload['datasets'], datasets, key_fn=lambda k, v: k)
         entries = self._filter_by(entries, sample_types, key_fn=lambda k, v: v.get('sample_type'))
 
         added = []
         for name, entry in entries.items():
-            key = f'{prefix if prefix is not None else payload['metadata']['name']}_{name}'
+            key = f'{payload['metadata']['name']}_{name}'
             if key in self.datasets:
                 raise ValueError(f"Dataset '{key}' already exists.")
             self.datasets[key] = SerializedDataset(
@@ -847,7 +858,7 @@ class Experiment:
         return added
     
     @classmethod
-    def from_serialized(cls, filepath: str, datasets: list[str] | None=None, sample_types: list[str] | None=None, prefix: str | None=None) -> Experiment:
+    def from_serialized(cls, filepath: str, recursive: bool=False, datasets: list[str] | None=None, sample_types: list[str] | None=None) -> Experiment:
         """Alternative constructor: build a new Experiment purely from serialized moduli data. 
         
         Use load() to merge in more files. self.config and self.calib are None; only plotting works.
@@ -857,10 +868,12 @@ class Experiment:
             exp = Experiment.from_serialized('data1.json')
             exp.load('data2.json')
             exp.plot_moduli(average=True)
+
+            exp = Experiment.from_serialized('data/**/*_cell.json', recursive=True)
         """
         self = cls.__new__(cls)
         self.config = self.calib = self.brownian_params = None
         self.datasets = Datasets({})
         self.fh = os.path.splitext(os.path.basename(filepath))[0]
-        self.load(filepath, datasets=datasets, sample_types=sample_types, prefix=prefix)
+        self.load(filepath, recursive=recursive, datasets=datasets, sample_types=sample_types)
         return self
