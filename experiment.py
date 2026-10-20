@@ -580,7 +580,7 @@ class Experiment:
         selected = self._filter_by(selected, sample_types, key_fn=lambda k, v: getattr(v, 'sample_type', None))
         return selected
 
-    def plot_moduli(self, datasets: list[str] | None=None, sample_types: list[str] | None=None, title: str | None=None, region: tuple[float, float] | None=None, corrected: bool=False, average: bool=False, show_std: bool=True, show_individual: bool=True, combine_axes: bool=False, axes=None) -> tuple[plt.Figure, plt.Axes, plt.Axes]:
+    def plot_moduli(self, datasets: list[str] | None=None, sample_types: list[str] | None=None, title: str | None=None, region: tuple[float, float] | None=None, corrected: bool=False, average: bool=False, show_std: bool=True, std_err: bool=False, show_individual: bool=True, combine_axes: bool=False, axes=None) -> tuple[plt.Figure, plt.Axes, plt.Axes]:
         """Plot G' and G'' for all datasets (or a subset) in the experiment.
         
         Parameters
@@ -599,6 +599,8 @@ class Experiment:
             If True, aditionally compute and plot the mean G' and G" active and passive curves
         show_std : bool
             If True (and average=True), show +/- 1 standard deviation as a filled region. Ignored if average=False
+        std_err : bool
+            If True (and average=True and show_std=True), show +/- 1 standard error as a filled region instead of the standard deviation.
         show_individual : bool
             If False (and average=True), hide the individual dataset traces and show only the averaged curves. Ignored if average=False
         combine_axes : bool
@@ -664,8 +666,8 @@ class Experiment:
                 ax2.loglog(omega, G2, **style, label=f'{name} G"')
 
         if average:
-            self._plot_group_average(ax1, ax2, passive_group, label='Passive avg', n_points=150, show_std=show_std, marker=None, linestyle='-', lw=1.5, alpha=0.9)
-            self._plot_group_average(ax1, ax2, active_group,  label='Active avg',  n_points=35, show_std=show_std, marker='o', linestyle='None', ms=4, alpha=0.9)
+            self._plot_group_average(ax1, ax2, passive_group, label='Passive', n_points=150, show_std=show_std, std_err=std_err, marker=None, linestyle='-', lw=1.5, alpha=0.9)
+            self._plot_group_average(ax1, ax2, active_group,  label='Active',  n_points=35, show_std=show_std, std_err=std_err, marker='o', linestyle='None', ms=4, alpha=0.9)
 
         for ax in (ax1, ax2):
             ax.set_xlabel(r'Angular Frequency $\omega$ [rad/s]', fontsize=12)
@@ -684,7 +686,7 @@ class Experiment:
 
         return fig, ax1, ax2
     
-    def _plot_group_average(self, ax1, ax2, group: dict, label: str, n_points: int=150, show_std: bool=True, **style):
+    def _plot_group_average(self, ax1, ax2, group: dict, label: str, n_points: int=150, show_std: bool=True, std_err: bool=False, **style):
         """Interpolate G' and G" onto a common log-spaced grid and plot the mean (+/- 1 std in logspace) for a group of datasets.
         
         Parameters
@@ -740,7 +742,8 @@ class Experiment:
             ax.loglog(omega_common, mean, color=col, **style, label=modulus_label)
 
             if show_std and curves.shape[0] > 1:
-                std = np.nanstd(curves, axis=0)
+                std = np.nanstd(curves, axis=0, ddof=1)
+                if std_err: std /= np.sqrt(curves.shape[0])
                 ax.fill_between(
                     omega_common, mean - std, mean + std,
                     color=col, alpha=0.15,

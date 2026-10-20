@@ -1,7 +1,7 @@
 from microrheo.base import OTDataset
 from microrheo.utils import *
 
-from scipy.signal import ShortTimeFFT, windows
+from scipy.signal import ShortTimeFFT, windows, savgol_filter
 
 class ActiveAnalysis(OTDataset):
     """Process active microrheology datasets.
@@ -97,7 +97,7 @@ class ActiveAnalysis(OTDataset):
         offset = np.where(np.abs(denom) > 1e-12, 0.5 * (alpha - gamma) / denom, 0.0)
         dom_freqs = SFT.f[dominant_bins] + offset * SFT.delta_f # dominant freq of bin i
                 
-        freq_tol = max(0.5 * SFT.delta_f, 0.1) # Hz
+        freq_tol = max(0.5 * SFT.delta_f, 0.05) # Hz
         
         freq_changes = np.where(np.abs(np.diff(dom_freqs)) > freq_tol)[0] + 1
         boundaries = np.concatenate(([0], freq_changes, [len(dom_freqs)])) # add first and last index        
@@ -122,20 +122,53 @@ class ActiveAnalysis(OTDataset):
                                         
         return dom_freqs, merged_boundaries
             
-    def compute_moduli(self, free_memory=True, debug_mode=False):
-        """Compute the shear moduli G' and G" from the active microrheology results."""
-        freq_list = self.results["fg_freqs"]
-        y0 = self.results["y0"]
-        f0 = self.results["f0"]
-        delta = self.results["delta"]
+    def compute_moduli(self, snr_threshold_db:float = 10, min_consecutive_chunks:int = 1, free_memory=True, show_plots=False):
+        """Compute the shear moduli G' and G" from the active microrheology results.
         
-        if debug_mode:
-            phi = self.results['phi']
-                
-        G1 = np.abs(f0 / (6 * np.pi * self.constants.r * y0)) * np.cos(delta)
-        G2 = np.abs(f0 / (6 * np.pi * self.constants.r * y0)) * np.sin(delta)
-               
-        if debug_mode:                         
+        Parameters
+        ----------
+        snr_threshold_db : float
+            Minimum SNR (in dB) for a chunk to be included in the moduli
+        min_consecutive_chunks : int
+            Minimum number of consecutive chunks with SNR above threshold to be included in the moduli
+        free_memory : bool
+            If True, free memory by deleting the data_dict and chunk_info after computing moduli
+        show_plots : bool
+            If True, show plots of the phases"""
+        
+        freq_list = np.asarray(self.results['fg_freqs'])
+        y0 = self.results['y0']
+        f0 = self.results['f0']
+        delta = self.results['delta']
+        phi = self.results['phi']
+
+        n = len(freq_list)
+        cuttoff_idx = n
+
+        snr = self.results['bead_snr']
+        below = snr < snr_threshold_db
+
+        for i in range(n - min_consecutive_chunks + 1):
+            if np.all(below[i:i + min_consecutive_chunks]):
+                cuttoff_idx = i
+                break
+
+        if cuttoff_idx < n:
+            freq_list = freq_list[:cuttoff_idx]
+            y0 = y0[:cuttoff_idx]
+            f0 = f0[:cuttoff_idx]
+            delta = delta[:cuttoff_idx]
+            phi = phi[:cuttoff_idx]
+
+        plt.figure()
+        plt.semilogx(freq_list, snr, 'k.', label='Bead SNR')
+        plt.axhline(snr_threshold_db, color='tab:orange', linestyle='--', label='SNR Threshold')
+        plt.xlabel('Frequency (Hz)')
+        plt.ylabel('SNR (dB)')
+        plt.title('Bead SNR vs Frequency')
+        plt.show()
+                               
+        if show_plots:                         
             plt.figure()
             plt.semilogx(freq_list, delta, 'r.', label='Bead-Force Phase')
             plt.semilogx(freq_list, phi-delta, 'g.', label='Force-FG Phase')
@@ -146,9 +179,16 @@ class ActiveAnalysis(OTDataset):
             plt.text(freq_list.min(), np.pi/2+0.01, r'$\pi/2$', ha='left', va='bottom', color='tab:blue')
             plt.axhline(-np.pi/2, color='tab:blue')
             plt.text(freq_list.min(), -np.pi/2+0.01, r'$-\pi/2$', ha='left', va='bottom', color='tab:blue')
+
+            plt.axvline(freq_list[cuttoff_idx-1], color='tab:orange', linestyle='--', label='SNR Cutoff')
+            plt.text(freq_list[cuttoff_idx-1], plt.ylim()[1], f'SNR Cutoff\n{freq_list[cuttoff_idx-1]:.2f} Hz', ha='left', va='top', color='tab:orange')
+
             plt.legend()
             plt.title('Phases')
             plt.show()
+
+        G1 = np.abs(f0 / (6 * np.pi * self.constants.r * y0)) * np.cos(delta)
+        G2 = np.abs(f0 / (6 * np.pi * self.constants.r * y0)) * np.sin(delta)
 
         if free_memory:
             self.data_dict, self.chunk_info = None, None
@@ -187,33 +227,49 @@ class ActiveAnalysis(OTDataset):
             
             valid_start = start_idx + int(skip * fs)
             valid_end = end_idx - int(skip * fs)
+
+            if valid_start >= valid_end:
+                print(f"Warning: Chunk {i} has no valid region after equilibration masking. Skipping this chunk.")
+                continue
             
             valid_mask[valid_start:valid_end] = True
             
         mid_idx = (change_idxs[:-1] + change_idxs[1:] - 1) // 2
         detected_freqs = dom_freqs[mid_idx]
 
-        commanded_freqs = np.concat(
-                            [np.geomspace(1, 5, 10)[:-1],
-                            np.geomspace(5, 1e4, 41)]
-                        )
+        if show_plots:
+            plt.figure(figsize=(8, 4.8))
+            plt.semilogy(dom_freqs, marker='.')
+            mid_idx = (change_idxs[:-1] + change_idxs[1:] - 1) // 2
+            [plt.text(i, dom_freqs[i]*1.01, f"{dom_freqs[i]:.3g}", ha='center', va='bottom') for i in mid_idx]
+            plt.title(f"Dominant Frequency Per Chunk")
+            plt.xlabel("Chunk Index")
+            plt.ylabel("Frequency (Hz)")
+            plt.tight_layout()
+            plt.show()
 
-        nearest_idx = np.abs(detected_freqs[:, None] - commanded_freqs[None, :]).argmin(axis=1)
-        self.fg_freqs = commanded_freqs[nearest_idx]
 
-        mismatch = np.abs(self.fg_freqs - detected_freqs) / self.fg_freqs
-        bad = np.where(mismatch > 0.05)[0]  # >5% off is worth a look
-        if len(bad):
-            print(f"Warning: {len(bad)} chunk(s) detected far from any commanded frequency: "
-                    f"chunk idx {bad}, detected {detected_freqs[bad]}, matched {self.fg_freqs[bad]}")
+        # commanded_freqs = np.concat(
+        #                     [np.geomspace(1, 5, 10)[:-1],
+        #                     np.geomspace(5, 1e4, 41)]
+        #                 )
+
+        # nearest_idx = np.abs(detected_freqs[:, None] - commanded_freqs[None, :]).argmin(axis=1)
+        self.fg_freqs = detected_freqs # commanded_freqs[nearest_idx]
+
+        # mismatch = np.abs(self.fg_freqs - detected_freqs) / self.fg_freqs
+        # bad = np.where(mismatch > 0.05)[0]  # >5% off is worth a look
+        # if len(bad):
+        #     print(f"Warning: {len(bad)} chunk(s) detected far from any commanded frequency: "
+        #             f"chunk idx {bad}, detected {detected_freqs[bad]}, matched {self.fg_freqs[bad]}")
 
         split_idxs = np.flatnonzero(np.diff(chunk_id[valid_mask])) + 1 # locates where the chunk id's change (e.g. 1 -> 2)
         self.chunked_fg = np.split(self.fg[valid_mask], split_idxs)
         self.chunked_y = np.split(self.y[valid_mask], split_idxs)
         self.chunked_t = np.split(self.t[valid_mask], split_idxs)
 
-        assert len(self.chunked_fg) == len(self.fg_freqs), \
-            f"Mismatch: {len(self.chunked_fg)} chunks vs {len(self.fg_freqs)} frequencies"
+        # assert len(self.chunked_fg) == len(self.fg_freqs), \
+        #     f"Mismatch: {len(self.chunked_fg)} chunks vs {len(self.fg_freqs)} frequencies"
         
         # trim each chunk to an integer number of periods
         trimmed_fg, trimmed_y, trimmed_t = [], [], []
@@ -229,17 +285,6 @@ class ActiveAnalysis(OTDataset):
         self.chunked_fg = trimmed_fg
         self.chunked_y = trimmed_y
         self.chunked_t = trimmed_t
-
-        if show_plots:
-            plt.figure(figsize=(8, 4.8))
-            plt.semilogy(dom_freqs, marker='.')
-            mid_idx = (change_idxs[:-1] + change_idxs[1:] - 1) // 2
-            [plt.text(i, dom_freqs[i]*1.01, f"{dom_freqs[i]:.3g}", ha='center', va='bottom') for i in mid_idx]
-            plt.title(f"Dominant Frequency Per Chunk")
-            plt.xlabel("Chunk Index")
-            plt.ylabel("Frequency (Hz)")
-            plt.tight_layout()
-            plt.show()
 
         if debug_mode:
             for i in range(n_chunks):
@@ -267,6 +312,60 @@ class ActiveAnalysis(OTDataset):
 
                 plt.show()
 
+    def _compute_chunk_snr(self, y_chunk, freq, exclude_harmonics=3):
+        """Estimate the SNR (dB) of a chunk of data at a given frequency.
+        
+        Parameters
+        ----------
+        y_chunk : np.ndarray
+            Bead signal for this frequency chunk (already trimmed to an integer number of periods)
+        freq : float
+            Drive frequency of the chunk (Hz)
+        exclude_harmonics : int
+            Number of harmonics of 'freq' to exclude from the noise estimate (default=3)
+
+        Returns
+        -------
+        snr_db : float
+            Estimated SNR in decibels (dB). Returns np.nan if the chunk is too short to compute a reliable SNR
+        """
+        n = len(y_chunk)
+        if n < 8: 
+            return np.nan # Not enough data to compute SNR
+
+        y = y_chunk - np.mean(y_chunk) # remove DC offset
+        win = windows.hann(n, sym=False)
+        Y = rfft(y * win)
+        freqs = rfftfreq(n, 1/fs)
+        power = np.abs(Y)**2
+
+        sig_bin = np.argmin(np.abs(freqs - freq))
+        sig_power = power[sig_bin]
+
+        noise_mask = np.ones_like(power, dtype=bool)
+        for h in range(1, exclude_harmonics + 1):
+            h_bin = np.argmin(np.abs(freqs - h * freq))
+            lo, hi = max(0, h_bin - 1), min(len(power), h_bin + 2) # 3 bin region around the harmonic
+            noise_mask[lo:hi] = False
+
+        noise_candidates = power[noise_mask]
+        if noise_candidates.size == 0:
+            return np.nan # No noise candidates left after excluding harmonics
+        noise_power = np.median(noise_candidates)
+        if noise_power <= 0:
+            return np.inf
+
+        plt.figure()
+        plt.semilogx(freqs, power, label='Power Spectrum')
+        plt.vlines([freq * h for h in range(1, exclude_harmonics + 1)], 0, np.max(power), color='r', linestyle='--', alpha=0.5, label='Excluded Harmonics')
+        plt.xlabel('Frequency (Hz)')
+        plt.ylabel('Power')
+        plt.title(f'Power Spectrum for {freq} Hz Chunk')
+        plt.legend()
+        plt.show()
+
+        return 10 * np.log10(sig_power / noise_power)
+
     def compute_force_phase(self, debug_mode=False):
         """Compute force magnitue and phase dependent components."""
                 
@@ -284,17 +383,24 @@ class ActiveAnalysis(OTDataset):
         phi_new = np.arctan2(B * np.sin(phi), A + B * np.cos(phi))
 
         delta_phi = phi - phi_new
+
+        # per_chunk bead SNR
+        bead_snr = np.array([
+            self._compute_chunk_snr(y, freq)
+            for y, freq in zip(self.chunked_y, self.fg_freqs)
+        ])
                 
         results = {
             'fg_freqs': self.fg_freqs,
             'f0': C,
             'y0': bead_amp,
             'delta': delta_phi,
+            'phi': phi,
+            'bead_snr': bead_snr,
+            'bead_y': self.chunked_y, 
+            'fg': self.chunked_fg
         }
-        
-        if debug_mode:
-            results.update({'phi': phi, 'bead_y': self.chunked_y, 'fg': self.chunked_fg})
-                        
+                                
         self.results = results
     
     def plot_g1g2(self):

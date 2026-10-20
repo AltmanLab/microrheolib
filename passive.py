@@ -146,7 +146,7 @@ class PassiveAnalysis(OTDataset):
 
             ax1.plot(logtau_rs, logmsd_rs, 'mo', ms=3, label=f'Resampled Data (n={n_points})')
             ax1.plot(logtau_rs, logmsd_smooth, 'b-', label='Gaussian Smoothed')
-            ax1.plot(logtau, logmsd, 'k*', ms=5, alpha=0.5, label='Raw')
+            ax1.plot(logtau, logmsd, 'k*', ms=5, alpha=0.01, label='Raw')
 
             if water_theory:
                 gamma = 6 * np.pi * self.constants.r * self.constants.eta

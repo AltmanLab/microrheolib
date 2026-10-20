@@ -10,7 +10,7 @@ plt.style.use('default')
 
 # ---------- CONSTANTS ---------- # ? maybe move these into the ExperimentalConstants dataclass?
 
-fs = 100000                  # data collection rate
+fs = 100000                 # data collection rate
 dt = 1/fs         
 kBT = 4.11e-21              # room temp (J)
 
